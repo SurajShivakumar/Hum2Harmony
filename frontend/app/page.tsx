@@ -1,101 +1,88 @@
 "use client";
 
-import { useRef, useState } from "react";
-import type { Note } from "@/lib/basicPitch";
-import { fileToAudioBuffer, transcribeAudio } from "@/lib/basicPitch";
-import { downloadMidi } from "@/lib/midiWriter";
-import { loadInstrument, playNotes, stopPlayback } from "@/lib/playback";
+import { useState } from "react";
+import { useRouter } from "next/navigation";
+import { uploadAudio } from "@/lib/api";
 import RecordButton from "@/components/RecordButton";
 import UploadZone from "@/components/UploadZone";
-import ProgressBar from "@/components/ProgressBar";
-import NoteVisualizer from "@/components/NoteVisualizer";
-import PlaybackControls from "@/components/PlaybackControls";
 
-type Stage = "idle" | "processing" | "done";
+type Stage = "idle" | "uploading" | "error";
 
 export default function Home() {
+  const router = useRouter();
   const [stage, setStage] = useState<Stage>("idle");
-  const [progress, setProgress] = useState(0);
-  const [notes, setNotes] = useState<Note[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
 
-  async function handleAudio(file: File) {
+  async function handleBlob(blob: Blob) {
+    setError(null);
+    setStage("uploading");
     try {
-      setError(null);
-      setStage("processing");
-      setProgress(0);
-      const buffer = await fileToAudioBuffer(file);
-      const detected = await transcribeAudio(buffer, setProgress);
-      setNotes(detected);
-      audioContextRef.current = await loadInstrument();
-      setStage("done");
+      // Save a local playback URL so the notes page can show the waveform
+      const localUrl = URL.createObjectURL(blob);
+      sessionStorage.setItem("recordingUrl", localUrl);
+
+      const { session_id } = await uploadAudio(blob);
+      router.push(`/notes?id=${session_id}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to transcribe audio");
+      setError(err instanceof Error ? err.message : "Upload failed. Is the server running?");
       setStage("idle");
     }
   }
 
-  function handlePlay() {
-    if (audioContextRef.current) playNotes(notes, audioContextRef.current);
-  }
-
-  function handleStop() {
-    stopPlayback();
-  }
-
-  function handleDownload() {
-    downloadMidi(notes);
-  }
-
-  function handleReset() {
-    stopPlayback();
-    setStage("idle");
-    setNotes([]);
-    setProgress(0);
-    setError(null);
+  async function handleFile(file: File) {
+    const blob = new Blob([await file.arrayBuffer()], { type: file.type });
+    await handleBlob(blob);
   }
 
   return (
-    <main className="min-h-screen bg-black text-white flex flex-col items-center justify-center gap-8 p-8">
-      <h1 className="text-4xl font-bold">🎵 Basic Pitch Demo</h1>
-      <p className="text-zinc-400 text-center">
-        Record or upload audio. Get MIDI back entirely in your browser.
-      </p>
+    <main className="min-h-screen bg-gradient-to-br from-violet-50 to-indigo-50 flex flex-col items-center justify-center gap-10 p-8">
 
+      {/* Title */}
+      <div className="text-center space-y-3">
+        <h1 className="text-5xl font-extrabold text-gray-900 tracking-tight">
+          🎵 Hum to Harmony
+        </h1>
+        <p className="text-gray-500 text-lg max-w-md mx-auto">
+          Hum a melody, upload a recording, and we'll transcribe it, sing it back,
+          and arrange it into a full choral score.
+        </p>
+      </div>
+
+      {/* Error banner */}
       {error && (
-        <div className="w-full max-w-2xl rounded-lg border border-red-700 bg-red-950 text-red-200 px-4 py-3 text-sm">
+        <div className="w-full max-w-md rounded-2xl border border-red-200 bg-red-50 text-red-700 px-5 py-3 text-sm">
           {error}
         </div>
       )}
 
-      {stage === "idle" && (
+      {/* Uploading state */}
+      {stage === "uploading" ? (
+        <div className="flex flex-col items-center gap-4 text-violet-600">
+          <span className="text-5xl animate-spin">⟳</span>
+          <p className="font-medium">Uploading and starting transcription…</p>
+        </div>
+      ) : (
         <div className="flex flex-col items-center gap-6 w-full max-w-md">
-          <UploadZone onFile={handleAudio} />
-          <p className="text-zinc-500">or</p>
-          <RecordButton onRecorded={handleAudio} />
+
+          {/* Record */}
+          <RecordButton onRecordingComplete={handleBlob} />
+
+          <div className="flex items-center gap-3 w-full">
+            <div className="flex-1 h-px bg-gray-200" />
+            <span className="text-sm text-gray-400">or upload a file</span>
+            <div className="flex-1 h-px bg-gray-200" />
+          </div>
+
+          {/* Upload */}
+          <UploadZone onFile={handleFile} />
+
         </div>
       )}
 
-      {stage === "processing" && (
-        <div className="flex flex-col items-center gap-4 w-full max-w-md">
-          <p className="text-zinc-300">Running Basic Pitch model...</p>
-          <ProgressBar progress={progress} />
-        </div>
-      )}
-
-      {stage === "done" && (
-        <div className="flex flex-col items-center gap-6 w-full max-w-5xl">
-          <p className="text-emerald-400">✓ {notes.length} notes detected</p>
-          <NoteVisualizer notes={notes} />
-          <PlaybackControls
-            onPlay={handlePlay}
-            onStop={handleStop}
-            onDownload={handleDownload}
-            onReset={handleReset}
-          />
-        </div>
-      )}
+      {/* Footer hint */}
+      <p className="text-xs text-gray-400 text-center max-w-sm">
+        Supports WAV, MP3, M4A, OGG, WebM · max ~30 seconds for best results
+      </p>
     </main>
   );
 }

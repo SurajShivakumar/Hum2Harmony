@@ -6,6 +6,7 @@ import { getSession } from "@/lib/api";
 import type { SessionData } from "@/lib/api";
 import PartPreview from "@/components/PartPreview";
 import DownloadButton from "@/components/DownloadButton";
+import ChoirPlayer from "@/components/ChoirPlayer";
 
 function ResultContent() {
   const router = useRouter();
@@ -106,6 +107,13 @@ function ResultContent() {
       ) : (
         <div className="bg-white rounded-3xl shadow-lg p-8 text-center text-gray-400">
           No part data available.
+        </div>
+      )}
+
+      {/* Choir audio */}
+      {hasParts && (
+        <div className="bg-white rounded-3xl shadow-lg p-8">
+          <ChoirPlayer sessionId={sessionId} />
         </div>
       )}
 

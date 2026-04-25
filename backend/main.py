@@ -16,13 +16,18 @@ import json
 import os
 import uuid
 
+from dotenv import load_dotenv
+load_dotenv()  # loads .env in the backend directory
+
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
 from core.basic_pitch_runner import transcribe_audio, estimate_tempo_from_notes, quantize_to_scale
 from core.chord_detection import detect_chords
+from core.elevenlabs_choir import generate_choir_audio
 from core.key_detection import detect_key
+from core.midi_refiner import refine_midi
 from core.musicxml_builder import build_musicxml
 from core.voice_assignment import assign_voices
 from database import get_db, init_db
@@ -35,9 +40,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AUDIO_DIR = "audio_files"
+AUDIO_DIR  = "audio_files"
+CHOIR_DIR  = os.path.join(AUDIO_DIR, "choir")
 os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(CHOIR_DIR, exist_ok=True)
 init_db()
+
+CHOIR_PARTS = ("soprano", "alto", "tenor", "bass", "mixed")
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +217,276 @@ async def get_session(session_id: str):
         "chords": chords,
         "parts": parts,
     }
+
+
+MELODY_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel — bright soprano
+
+
+def _melody_path(session_id: str) -> str:
+    return os.path.join(CHOIR_DIR, f"{session_id}_melody.wav")
+
+def _melody_flag(session_id: str, suffix: str) -> str:
+    return os.path.join(CHOIR_DIR, f"{session_id}_melody.{suffix}")
+
+
+def run_melody_synthesis(session_id: str) -> None:
+    """Background: sing the raw melody notes with one ElevenLabs voice."""
+    from core.elevenlabs_choir import _synth_part, _to_wav_bytes, SAMPLE_RATE
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+
+    open(_melody_flag(session_id, "generating"), "w").close()
+
+    db = get_db()
+    try:
+        melody = db.execute(
+            "SELECT notes FROM melodies WHERE session_id=?", (session_id,)
+        ).fetchone()
+        db.close()
+
+        if not melody:
+            raise ValueError("No melody found — run /analyze first")
+
+        notes = json.loads(melody["notes"])
+        audio = _synth_part(notes, MELODY_VOICE_ID, api_key, SAMPLE_RATE)
+        with open(_melody_path(session_id), "wb") as f:
+            f.write(_to_wav_bytes(audio, SAMPLE_RATE))
+
+    except Exception as exc:
+        print(f"[melody-voice] session={session_id} error: {exc}")
+        with open(_melody_flag(session_id, "error"), "w") as f:
+            f.write(str(exc))
+    finally:
+        try:
+            os.remove(_melody_flag(session_id, "generating"))
+        except OSError:
+            pass
+
+
+@app.post("/melody-voice/{session_id}")
+async def start_melody_voice(session_id: str, background_tasks: BackgroundTasks):
+    """Kick off ElevenLabs singing of the raw melody ("dom" syllables)."""
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="ELEVENLABS_API_KEY is not set.")
+
+    db = get_db()
+    row = db.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if row["status"] not in ("notes_ready", "harmonizing", "complete"):
+        raise HTTPException(status_code=400, detail="Transcription not complete yet")
+
+    if os.path.exists(_melody_path(session_id)):
+        return {"status": "ready"}
+    if os.path.exists(_melody_flag(session_id, "generating")):
+        return {"status": "generating"}
+
+    try:
+        os.remove(_melody_flag(session_id, "error"))
+    except OSError:
+        pass
+
+    background_tasks.add_task(run_melody_synthesis, session_id)
+    return {"status": "generating"}
+
+
+@app.get("/melody-voice/{session_id}")
+async def get_melody_voice_status(session_id: str):
+    """Poll ElevenLabs melody synthesis status."""
+    if os.path.exists(_melody_flag(session_id, "generating")):
+        return {"status": "generating"}
+    if os.path.exists(_melody_flag(session_id, "error")):
+        with open(_melody_flag(session_id, "error")) as f:
+            return {"status": "failed", "error": f.read()}
+    if os.path.exists(_melody_path(session_id)):
+        return {"status": "ready"}
+    return {"status": "idle"}
+
+
+@app.get("/melody-voice/audio/{session_id}")
+async def get_melody_voice_audio(session_id: str):
+    """Stream the ElevenLabs melody WAV."""
+    path = _melody_path(session_id)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Audio not ready yet")
+    with open(path, "rb") as f:
+        return Response(
+            content=f.read(),
+            media_type="audio/wav",
+            headers={"Content-Disposition": "inline; filename=melody-voice.wav"},
+        )
+
+
+def _choir_path(session_id: str, part: str) -> str:
+    return os.path.join(CHOIR_DIR, f"{session_id}_{part}.wav")
+
+def _choir_flag(session_id: str, suffix: str) -> str:
+    return os.path.join(CHOIR_DIR, f"{session_id}.{suffix}")
+
+
+def run_choir_synthesis(session_id: str) -> None:
+    """Background: generate SATB + mixed choir audio via ElevenLabs."""
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+
+    # Mark as in-progress
+    open(_choir_flag(session_id, "generating"), "w").close()
+    error_path = _choir_flag(session_id, "error")
+
+    db = get_db()
+    try:
+        arrangement = db.execute(
+            "SELECT soprano, alto, tenor, bass FROM arrangements WHERE session_id=?",
+            (session_id,),
+        ).fetchone()
+        db.close()
+
+        if not arrangement:
+            raise ValueError("No arrangement found — run /harmonize first")
+
+        parts = {
+            "soprano": json.loads(arrangement["soprano"]),
+            "alto":    json.loads(arrangement["alto"]),
+            "tenor":   json.loads(arrangement["tenor"]),
+            "bass":    json.loads(arrangement["bass"]),
+        }
+
+        audio_map = generate_choir_audio(parts, api_key)
+
+        for part, wav_bytes in audio_map.items():
+            if wav_bytes:
+                with open(_choir_path(session_id, part), "wb") as f:
+                    f.write(wav_bytes)
+
+    except Exception as exc:
+        print(f"[choir] session={session_id} error: {exc}")
+        with open(error_path, "w") as f:
+            f.write(str(exc))
+    finally:
+        # Remove in-progress sentinel
+        try:
+            os.remove(_choir_flag(session_id, "generating"))
+        except OSError:
+            pass
+
+
+@app.post("/choir/{session_id}")
+async def start_choir(session_id: str, background_tasks: BackgroundTasks):
+    """Kick off ElevenLabs choir synthesis for a completed arrangement."""
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ELEVENLABS_API_KEY is not set. "
+                "Add it to backend/.env and restart the server."
+            ),
+        )
+
+    db = get_db()
+    row = db.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+    db.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if row["status"] != "complete":
+        raise HTTPException(status_code=400, detail="Arrangement not complete yet")
+
+    # If already done, just say so
+    if os.path.exists(_choir_path(session_id, "mixed")):
+        return {"status": "ready"}
+
+    # Avoid double-generation
+    if os.path.exists(_choir_flag(session_id, "generating")):
+        return {"status": "generating"}
+
+    # Clear any previous error
+    try:
+        os.remove(_choir_flag(session_id, "error"))
+    except OSError:
+        pass
+
+    background_tasks.add_task(run_choir_synthesis, session_id)
+    return {"status": "generating"}
+
+
+@app.get("/choir/{session_id}")
+async def get_choir_status(session_id: str):
+    """Poll choir synthesis status. Returns ready parts once complete."""
+    if os.path.exists(_choir_flag(session_id, "generating")):
+        return {"status": "generating", "parts": []}
+
+    if os.path.exists(_choir_flag(session_id, "error")):
+        with open(_choir_flag(session_id, "error")) as f:
+            msg = f.read()
+        return {"status": "failed", "error": msg, "parts": []}
+
+    ready = [p for p in CHOIR_PARTS if os.path.exists(_choir_path(session_id, p))]
+    if ready:
+        return {"status": "ready", "parts": ready}
+
+    return {"status": "idle", "parts": []}
+
+
+@app.get("/choir/audio/{session_id}/{part}")
+async def get_choir_audio(session_id: str, part: str):
+    """Stream a single choir part WAV (soprano/alto/tenor/bass/mixed)."""
+    if part not in CHOIR_PARTS:
+        raise HTTPException(status_code=400, detail=f"Unknown part: {part}")
+    path = _choir_path(session_id, part)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Audio not ready yet")
+    with open(path, "rb") as f:
+        wav_bytes = f.read()
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"inline; filename={part}.wav"},
+    )
+
+
+@app.post("/refine/{session_id}")
+async def refine(session_id: str):
+    """
+    Refine the session's raw notes into a cleaner MIDI using a local
+    deterministic pipeline (no external API key required).
+    """
+    import asyncio
+    from functools import partial
+
+    db = get_db()
+    row = db.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+    melody = db.execute(
+        "SELECT notes FROM melodies WHERE session_id=?", (session_id,)
+    ).fetchone()
+    session_row = db.execute(
+        "SELECT tempo, key_name, key_mode FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
+    db.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not melody:
+        raise HTTPException(status_code=400, detail="No notes yet — run /analyze first")
+
+    notes = json.loads(melody["notes"])
+    tempo = int((session_row["tempo"] or 120) if session_row else 120)
+    key_name = session_row["key_name"] if session_row else None
+    key_mode = session_row["key_mode"] if session_row else None
+
+    try:
+        loop = asyncio.get_event_loop()
+        midi_bytes: bytes = await loop.run_in_executor(
+            None, partial(refine_midi, notes, tempo, key_name, key_mode)
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Local refinement failed: {exc}")
+
+    return Response(
+        content=midi_bytes,
+        media_type="audio/midi",
+        headers={"Content-Disposition": "attachment; filename=refined.mid"},
+    )
 
 
 @app.get("/export/{session_id}")

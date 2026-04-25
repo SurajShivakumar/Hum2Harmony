@@ -156,7 +156,7 @@ function monophonize(notes: NoteEvent[]): NoteEvent[] {
 function removePitchOutliers(
   notes: NoteEvent[],
   windowHalf = 4,
-  maxDev = 7,
+  maxDev = 9,
 ): NoteEvent[] {
   if (notes.length < 3) return notes;
   const pitches = notes.map(n => n.pitch);
@@ -175,7 +175,7 @@ function removePitchOutliers(
  * notes that are ≤ 1 semitone apart and close in time (< one 8th note gap).
  * The louder note's pitch wins; duration spans both notes.
  */
-function snapAndMergePitch(notes: NoteEvent[], eighthSec: number): NoteEvent[] {
+function snapAndMergePitch(notes: NoteEvent[], eighthSec: number, sixteenthSec: number): NoteEvent[] {
   const snapped = notes.map(n => ({
     ...n,
     pitch: Math.round(n.pitch),
@@ -186,7 +186,7 @@ function snapAndMergePitch(notes: NoteEvent[], eighthSec: number): NoteEvent[] {
   for (const n of snapped) {
     const prev = out[out.length - 1];
     const gap = prev ? n.start_time - (prev.start_time + prev.duration) : Infinity;
-    if (prev && Math.abs(n.pitch - prev.pitch) <= 1 && gap < eighthSec) {
+    if (prev && Math.abs(n.pitch - prev.pitch) <= 1 && gap < sixteenthSec) {
       const newEnd = Math.max(prev.start_time + prev.duration, n.start_time + n.duration);
       const pa = (prev as NoteEvent & { amplitude?: number }).amplitude ?? 0;
       const na = (n    as NoteEvent & { amplitude?: number }).amplitude ?? 0;
@@ -256,13 +256,13 @@ function mergeSamePitch(notes: NoteEvent[], beatSec: number, sixteenthSec: numbe
 function resolveOverlaps(notes: NoteEvent[], beatSec: number, sixteenthSec: number): NoteEvent[] {
   const out: NoteEvent[] = [];
   for (const n of notes) {
-    if (n.duration < sixteenthSec * 0.75) continue;
+    if (n.duration < sixteenthSec * 0.5) continue;
     const prev = out[out.length - 1];
     if (prev) {
       const prevEnd = prev.start_time + prev.duration;
       if (n.start_time < prevEnd - 0.001) {
         const trimmed = snapDuration(n.start_time - prev.start_time, beatSec);
-        if (trimmed < sixteenthSec * 0.75) { out.pop(); }
+        if (trimmed < sixteenthSec * 0.5) { out.pop(); }
         else { prev.duration = trimmed; }
       }
     }
@@ -348,7 +348,7 @@ export function simplifyForMidi(
 
   let out = monophonize(notes);          // collapse chords → single lead note
   out = removePitchOutliers(out);
-  out = snapAndMergePitch(out, eighthSec);
+  out = snapAndMergePitch(out, eighthSec, sixteenthSec);
   out = snapToScale(out, scalePCs);          // snap accidentals to key
   out = quantizeStarts(out, sixteenthSec);
   out = quantizeDurations(out, beatSec, sixteenthSec);

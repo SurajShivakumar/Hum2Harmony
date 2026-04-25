@@ -49,7 +49,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
     return mono.filter((_, i) => {
       const lo = Math.max(0, i - 4), hi = Math.min(mono.length, i + 5);
       const s = pitches.slice(lo, hi).slice().sort((a, b) => a - b);
-      return Math.abs(pitches[i] - s[Math.floor(s.length / 2)]) <= 7;
+      return Math.abs(pitches[i] - s[Math.floor(s.length / 2)]) <= 9;
     });
   })();
 
@@ -59,7 +59,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   for (const n of snapped) {
     const prev = merged[merged.length - 1];
     const gap  = prev ? n.startTimeSeconds - (prev.startTimeSeconds + prev.durationSeconds) : Infinity;
-    if (prev && Math.abs(n.pitchMidi - prev.pitchMidi) <= 1 && gap < eighth) {
+    if (prev && Math.abs(n.pitchMidi - prev.pitchMidi) <= 1 && gap < sixteenth) {
       const newEnd = Math.max(prev.startTimeSeconds + prev.durationSeconds, n.startTimeSeconds + n.durationSeconds);
       if (n.amplitude > prev.amplitude) prev.pitchMidi = n.pitchMidi;
       prev.durationSeconds = newEnd - prev.startTimeSeconds;
@@ -99,13 +99,13 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   // 7. Overlap fix + sub-16th filter
   const result: Note[] = [];
   for (const n of merged2) {
-    if (n.durationSeconds < sixteenth * 0.75) continue;
+    if (n.durationSeconds < sixteenth * 0.5) continue;
     const prev = result[result.length - 1];
     if (prev) {
       const prevEnd = prev.startTimeSeconds + prev.durationSeconds;
       if (n.startTimeSeconds < prevEnd - 0.001) {
         const trimmed = snapDuration(n.startTimeSeconds - prev.startTimeSeconds, beatSec);
-        if (trimmed < sixteenth * 0.75) result.pop(); else prev.durationSeconds = trimmed;
+        if (trimmed < sixteenth * 0.5) result.pop(); else prev.durationSeconds = trimmed;
       }
     }
     result.push({ ...n });

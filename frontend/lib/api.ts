@@ -63,6 +63,89 @@ export async function harmonizeSession(sessionId: string): Promise<void> {
   if (!res.ok) throw new Error(`Harmonize failed: ${res.status}`);
 }
 
+// ── Melody voice (ElevenLabs single-voice preview) ───────────────────────────
+
+export type MelodyVoiceStatus = "idle" | "generating" | "ready" | "failed";
+
+export interface MelodyVoiceStatusResponse {
+  status: MelodyVoiceStatus;
+  error?: string;
+}
+
+export async function startMelodyVoice(sessionId: string): Promise<MelodyVoiceStatusResponse> {
+  const res = await fetch(`${BASE}/melody-voice/${sessionId}`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getMelodyVoiceStatus(sessionId: string): Promise<MelodyVoiceStatusResponse> {
+  const res = await fetch(`${BASE}/melody-voice/${sessionId}`);
+  if (!res.ok) throw new Error(`Status fetch failed: ${res.status}`);
+  return res.json();
+}
+
+export function melodyVoiceAudioUrl(sessionId: string): string {
+  return `${BASE}/melody-voice/audio/${sessionId}`;
+}
+
+// ── Choir (ElevenLabs) ───────────────────────────────────────────────────────
+
+export type ChoirStatus = "idle" | "generating" | "ready" | "failed";
+
+export interface ChoirStatusResponse {
+  status: ChoirStatus;
+  parts: string[];
+  error?: string;
+}
+
+/** Kick off ElevenLabs choir synthesis for a completed arrangement. */
+export async function startChoir(sessionId: string): Promise<ChoirStatusResponse> {
+  const res = await fetch(`${BASE}/choir/${sessionId}`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Choir start failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Poll choir synthesis status. */
+export async function getChoirStatus(sessionId: string): Promise<ChoirStatusResponse> {
+  const res = await fetch(`${BASE}/choir/${sessionId}`);
+  if (!res.ok) throw new Error(`Choir status failed: ${res.status}`);
+  return res.json();
+}
+
+/** Return the URL to stream a choir part WAV directly (for <audio> src). */
+export function choirAudioUrl(sessionId: string, part: string): string {
+  return `${BASE}/choir/audio/${sessionId}/${part}`;
+}
+
+// ── MIDI refinement ──────────────────────────────────────────────────────────
+
+/**
+ * Send the session's notes to the backend local refinement pipeline, then
+ * trigger a browser download of the cleaned MIDI file.
+ */
+export async function refineAndDownloadMidi(sessionId: string): Promise<void> {
+  const res = await fetch(`${BASE}/refine/${sessionId}`, { method: "POST" });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Refine failed: ${res.status}`);
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "refined.mid";
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 /** Download the MusicXML arrangement. */
 export async function downloadArrangement(sessionId: string): Promise<void> {
   const res = await fetch(`${BASE}/export/${sessionId}`);
