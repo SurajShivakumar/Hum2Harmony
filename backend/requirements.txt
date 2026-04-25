@@ -1,0 +1,17 @@
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+basic-pitch==0.3.2
+# 1.26 has no prebuilt wheel on Python 3.13+; use NumPy 2.x there
+numpy==1.26.4; python_version < "3.13"
+numpy>=2.0.0,<3.0.0; python_version >= "3.13"
+librosa==0.10.2
+soundfile==0.12.1
+
+# ffmpeg must be installed separately on the system:
+#   Windows: winget install ffmpeg   OR   choco install ffmpeg
+#   macOS:   brew install ffmpeg
+#   Ubuntu:  apt install ffmpeg
+# ffmpeg is used to convert webm/ogg/mp4 browser recordings to WAV before
+# Basic Pitch inference. Without it, the fallback is to pass the original
+# file directly (works for WAV/FLAC uploads, may fail for webm).
