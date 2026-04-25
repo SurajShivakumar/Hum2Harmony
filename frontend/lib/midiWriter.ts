@@ -1,5 +1,6 @@
 import MidiWriter from "midi-writer-js";
 import type { Note } from "./basicPitch";
+import { cleanBpm, snapDuration, snapPitchToScale, parseKey, STANDARD_BEATS } from "./midiSimplify";
 
 const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 function midiToName(midi: number): string {
@@ -8,16 +9,131 @@ function midiToName(midi: number): string {
   return `${NAMES[clamped % 12]}${octave}`;
 }
 
-export function notesToMidiUri(notes: Note[]): string {
-  const track = new MidiWriter.Track();
-  track.setTempo(120);
+/**
+ * Same pipeline as simplifyForMidi (NoteEvent path) but for the basicPitch
+ * Note type (different field names).
+ */
+function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
+  if (!notes.length) return [];
 
-  for (const note of notes) {
+  const bpmClean  = cleanBpm(bpm);
+  const beatSec   = 60 / bpmClean;
+  const sixteenth = beatSec / 4;
+  const eighth    = beatSec / 2;
+
+  // 0. Monophonize — collapse any chords/overlaps to the loudest/highest note
+  const mono = (() => {
+    const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+    const out: Note[] = [];
+    for (const n of sorted) {
+      const prev = out[out.length - 1];
+      if (!prev || n.startTimeSeconds >= prev.startTimeSeconds + prev.durationSeconds - 0.001) {
+        out.push({ ...n }); continue;
+      }
+      const newIsLead =
+        n.amplitude > prev.amplitude + 0.05 ||
+        (Math.abs(n.amplitude - prev.amplitude) <= 0.05 && n.pitchMidi > prev.pitchMidi);
+      if (newIsLead) {
+        const trimmed = n.startTimeSeconds - prev.startTimeSeconds;
+        if (trimmed < 0.05) out.pop(); else prev.durationSeconds = trimmed;
+        out.push({ ...n });
+      }
+    }
+    return out;
+  })();
+
+  // 1. Remove pitch outliers (sliding median)
+  const filtered = (() => {
+    if (mono.length < 3) return mono;
+    const pitches = mono.map(n => n.pitchMidi);
+    return mono.filter((_, i) => {
+      const lo = Math.max(0, i - 4), hi = Math.min(mono.length, i + 5);
+      const s = pitches.slice(lo, hi).slice().sort((a, b) => a - b);
+      return Math.abs(pitches[i] - s[Math.floor(s.length / 2)]) <= 7;
+    });
+  })();
+
+  // 2. Snap pitches + merge within 1 semitone
+  const snapped = filtered.map(n => ({ ...n, pitchMidi: Math.round(n.pitchMidi) }));
+  const merged: Note[] = [];
+  for (const n of snapped) {
+    const prev = merged[merged.length - 1];
+    const gap  = prev ? n.startTimeSeconds - (prev.startTimeSeconds + prev.durationSeconds) : Infinity;
+    if (prev && Math.abs(n.pitchMidi - prev.pitchMidi) <= 1 && gap < eighth) {
+      const newEnd = Math.max(prev.startTimeSeconds + prev.durationSeconds, n.startTimeSeconds + n.durationSeconds);
+      if (n.amplitude > prev.amplitude) prev.pitchMidi = n.pitchMidi;
+      prev.durationSeconds = newEnd - prev.startTimeSeconds;
+    } else {
+      merged.push({ ...n });
+    }
+  }
+
+  // 3. Quantize starts to 16th grid, durations to standard values only
+  const quantized = merged.map(n => {
+    const qStart = Math.round(n.startTimeSeconds / sixteenth) * sixteenth;
+    const dur    = Math.max(sixteenth, snapDuration(n.durationSeconds, beatSec));
+    return { ...n, startTimeSeconds: qStart, durationSeconds: dur };
+  });
+
+  // 4. Snap to scale (major key preference)
+  const scalePCs = parseKey(musicalKey ?? "");
+  const scaled = scalePCs
+    ? quantized.map(n => ({ ...n, pitchMidi: snapPitchToScale(n.pitchMidi, scalePCs) }))
+    : quantized;
+
+  // 5. Merge same-pitch notes after scale snap
+  const merged2: Note[] = [];
+  for (const n of scaled) {
+    const prev = merged2[merged2.length - 1];
+    if (prev && prev.pitchMidi === n.pitchMidi) {
+      const gap = n.startTimeSeconds - (prev.startTimeSeconds + prev.durationSeconds);
+      if (gap < sixteenth * 0.5) {
+        const combined = n.startTimeSeconds + n.durationSeconds - prev.startTimeSeconds;
+        const snappedC = snapDuration(combined, beatSec);
+        if (Math.abs(snappedC - combined) <= sixteenth * 0.55) { prev.durationSeconds = snappedC; continue; }
+      }
+    }
+    merged2.push({ ...n });
+  }
+
+  // 7. Overlap fix + sub-16th filter
+  const result: Note[] = [];
+  for (const n of merged2) {
+    if (n.durationSeconds < sixteenth * 0.75) continue;
+    const prev = result[result.length - 1];
+    if (prev) {
+      const prevEnd = prev.startTimeSeconds + prev.durationSeconds;
+      if (n.startTimeSeconds < prevEnd - 0.001) {
+        const trimmed = snapDuration(n.startTimeSeconds - prev.startTimeSeconds, beatSec);
+        if (trimmed < sixteenth * 0.75) result.pop(); else prev.durationSeconds = trimmed;
+      }
+    }
+    result.push({ ...n });
+  }
+
+  // 8. Normalize dynamics
+  const amps = result.map(n => n.amplitude);
+  const mean = amps.reduce((s, a) => s + a, 0) / (amps.length || 1);
+  return result.map(n => ({
+    ...n,
+    amplitude: Math.max(0.60, Math.min(0.88, n.amplitude * 0.3 + mean * 0.7)),
+  }));
+}
+
+export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): string {
+  const bpmClean    = cleanBpm(bpm);
+  const simplified  = simplify(notes, bpmClean, musicalKey);
+  const ticksPerSec = (bpmClean / 60) * 128;
+
+  const track = new MidiWriter.Track();
+  track.setTempo(bpmClean);
+
+  for (const note of simplified) {
     track.addEvent(
       new MidiWriter.NoteEvent({
         pitch: [midiToName(note.pitchMidi)],
-        duration: `T${Math.max(1, Math.round(note.durationSeconds * 128))}`,
-        startTick: Math.max(0, Math.round(note.startTimeSeconds * 128)),
+        duration: `T${Math.max(1, Math.round(note.durationSeconds * ticksPerSec))}`,
+        startTick: Math.max(0, Math.round(note.startTimeSeconds * ticksPerSec)),
         velocity: Math.max(1, Math.min(100, Math.round(note.amplitude * 100))),
       })
     );

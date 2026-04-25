@@ -2,10 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { NoteEvent } from "@/lib/api";
+import { simplifyForMidi } from "@/lib/midiSimplify";
 
 interface NotePlayerProps {
   notes: NoteEvent[];
   tempo: number;
+  musicalKey?: string;
   onTimeUpdate?: (t: number) => void;
 }
 
@@ -30,7 +32,7 @@ const SALAMANDER_URLS: Record<string, string> = {
   A7: "A7.mp3",  C8: "C8.mp3",
 };
 
-export default function NotePlayer({ notes, tempo, onTimeUpdate }: NotePlayerProps) {
+export default function NotePlayer({ notes, tempo, musicalKey, onTimeUpdate }: NotePlayerProps) {
   const [samplerReady, setSamplerReady] = useState(false);
   const [loading, setLoading] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -100,8 +102,10 @@ export default function NotePlayer({ notes, tempo, onTimeUpdate }: NotePlayerPro
 
     Tone.Transport.bpm.value = tempo;
 
-    // Schedule every note — Sampler handles unlimited simultaneous voices
-    const events = notes.map((n) => ({
+    // Simplify: grid quantize + scale snap + dynamics normalize
+    const simplified = simplifyForMidi(notes, tempo, musicalKey);
+
+    const events = simplified.map((n) => ({
       time: n.start_time,
       note: midiToTone(n.pitch),
       duration: Math.max(0.1, n.duration),

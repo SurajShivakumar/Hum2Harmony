@@ -158,6 +158,7 @@ function NotesContent() {
               <NotePlayer
                 notes={notes}
                 tempo={tempo}
+                musicalKey={key}
                 onTimeUpdate={setPianoTime}
               />
               <p className="text-xs text-gray-400">
