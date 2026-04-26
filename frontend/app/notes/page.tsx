@@ -4,7 +4,7 @@ import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { getSession, harmonizeSessionWithNotes, refineAndDownloadMidi, updateSessionNotes } from "@/lib/api";
 import type { NoteEvent, SessionStatus } from "@/lib/api";
-import type { Note } from "@/lib/basicPitch";
+import type { MidiExportNote } from "@/lib/midiExportNote";
 import { notesToRawMidiUri } from "@/lib/midiWriter";
 import { combineSustainArtifacts } from "@/lib/noteCleanup";
 import AudioPlayer from "@/components/AudioPlayer";
@@ -355,7 +355,7 @@ function NotesContent() {
   };
 
   const handleDownloadMidi = () => {
-    const basicNotes: Note[] = notes.map(n => ({
+    const basicNotes: MidiExportNote[] = notes.map(n => ({
       pitchMidi:          n.pitch,
       startTimeSeconds:   n.start_time,
       durationSeconds:    n.duration,
