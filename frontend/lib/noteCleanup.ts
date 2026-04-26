@@ -48,5 +48,50 @@ export function combineSustainArtifacts(notes: NoteEvent[]): NoteEvent[] {
     i += 1;
   }
 
-  return out;
+  return removeIsolatedHighPitchOutliers(out);
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * Delete obvious transcription spikes that are far above the local melody.
+ *
+ * Neural transcribers sometimes produce a lone upper harmonic several octaves
+ * above the sung line. Keep real melodic high notes if nearby notes support
+ * that register; remove only isolated notes that are much higher than both the
+ * local neighborhood and the song's typical range.
+ */
+function removeIsolatedHighPitchOutliers(notes: NoteEvent[]): NoteEvent[] {
+  if (notes.length < 4) return notes;
+
+  const pitches = notes.map((n) => Math.round(n.pitch));
+  const globalMedian = median(pitches);
+  const upperQuartile = median([...pitches].sort((a, b) => a - b).slice(Math.floor(pitches.length / 2)));
+
+  return notes.filter((note, i) => {
+    const pitch = Math.round(note.pitch);
+    const lo = Math.max(0, i - 4);
+    const hi = Math.min(notes.length, i + 5);
+    const neighborPitches = notes
+      .slice(lo, hi)
+      .filter((_, localIndex) => lo + localIndex !== i)
+      .map((n) => Math.round(n.pitch));
+
+    if (neighborPitches.length < 2) return true;
+
+    const localMedian = median(neighborPitches);
+    const nearestNeighborDistance = Math.min(...neighborPitches.map((p) => Math.abs(p - pitch)));
+    const farAboveLocalLine = pitch - localMedian >= 12;
+    const farAboveTypicalRange = pitch - globalMedian >= 18 || pitch - upperQuartile >= 12;
+    const unsupportedByNeighbors = nearestNeighborDistance >= 9;
+    const briefSpike = note.duration <= 0.55;
+
+    return !(farAboveLocalLine && unsupportedByNeighbors && (farAboveTypicalRange || briefSpike));
+  });
 }

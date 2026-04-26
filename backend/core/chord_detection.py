@@ -47,6 +47,11 @@ def detect_chords(
       1) weighted pitch-class coverage in the segment
       2) end-note cadence fit
       3) smooth root motion from previous chord
+
+    Chord boundaries favor places where the melody naturally gives harmony room:
+    unusually long held notes, larger-than-normal gaps/onset spacing, strong
+    melodic motion, or measure boundaries. A light note-density target keeps
+    segments from having wildly different note counts within a phrase.
     """
     if not notes:
         return []
@@ -58,9 +63,18 @@ def detect_chords(
     diatonic = build_diatonic_chords(key_root_pc, key_mode)
     chords: list[dict] = []
 
-    gap_break = beat_dur * 0.75
-    min_segment = beat_dur * 0.5
-    max_segment = beat_dur * 2.0
+    gap_break = beat_dur * 1.0
+    min_segment = measure_dur * 0.75
+    max_segment = measure_dur * 2.25
+
+    def median_or(values: list[float], fallback: float) -> float:
+        if not values:
+            return fallback
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[mid]
+        return (ordered[mid - 1] + ordered[mid]) / 2
 
     phrases: list[list[dict]] = []
     current: list[dict] = []
@@ -144,23 +158,78 @@ def detect_chords(
         phrase_start = float(phrase[0]["start_time"])
         phrase_end = max(float(n["end_time"]) for n in phrase)
         boundaries = [phrase_start]
-        segment_start = phrase_start
-        anchor_pitch = int(phrase[0]["pitch"])
 
-        for prev, cur in zip(phrase, phrase[1:]):
-            cur_start = float(cur["start_time"])
-            elapsed = cur_start - segment_start
-            interval = abs(int(cur["pitch"]) - anchor_pitch)
-            crossed_measure = int(segment_start / measure_dur) != int(cur_start / measure_dur)
+        durations = [
+            max(0.01, float(n.get("duration", float(n["end_time"]) - float(n["start_time"]))))
+            for n in phrase
+        ]
+        onset_spacings = [
+            max(0.0, float(cur["start_time"]) - float(prev["start_time"]))
+            for prev, cur in zip(phrase, phrase[1:])
+        ]
+        silent_gaps = [
+            max(0.0, float(cur["start_time"]) - float(prev["end_time"]))
+            for prev, cur in zip(phrase, phrase[1:])
+        ]
 
-            if elapsed >= min_segment and (
-                elapsed >= max_segment
-                or interval >= 5
-                or crossed_measure
-            ):
-                boundaries.append(cur_start)
-                segment_start = cur_start
-                anchor_pitch = int(cur["pitch"])
+        median_duration = median_or(durations, beat_dur * 0.5)
+        median_onset_spacing = median_or(onset_spacings, beat_dur * 0.5)
+        median_silent_gap = median_or([g for g in silent_gaps if g > 0.02], beat_dur * 0.25)
+
+        long_sustain_threshold = max(beat_dur * 0.9, median_duration * 1.9)
+        long_spacing_threshold = max(beat_dur * 0.9, median_onset_spacing * 1.9)
+        long_gap_threshold = max(beat_dur * 0.65, median_silent_gap * 2.2)
+
+        phrase_measures = max((phrase_end - phrase_start) / measure_dur, 1.0)
+        notes_per_measure = len(phrase) / phrase_measures
+
+        gap_count = sum(1 for g in silent_gaps if g >= long_gap_threshold)
+        gap_density = gap_count / phrase_measures
+        # Dense continuous singing gets slower harmonic rhythm. Phrases with
+        # clear rests/gaps can support one chord per measure.
+        target_segment = measure_dur if gap_density >= 0.6 or notes_per_measure <= 4 else measure_dur * 2
+        target_segment = min(max(target_segment, min_segment), max_segment)
+        search_radius = beat_dur * 0.65
+
+        def boundary_candidates(target: float) -> list[tuple[float, float]]:
+            candidates: list[tuple[float, float]] = []
+            for prev, cur in zip(phrase, phrase[1:]):
+                prev_start = float(prev["start_time"])
+                cur_start = float(cur["start_time"])
+                prev_end = float(prev["end_time"])
+                onset_spacing = cur_start - prev_start
+                silent_gap = max(0.0, cur_start - prev_end)
+                prev_duration = max(
+                    0.01,
+                    float(prev.get("duration", prev_end - prev_start)),
+                )
+
+                for at, weight in (
+                    (cur_start, 2.5 if silent_gap >= long_gap_threshold else 0.0),
+                    (cur_start, 1.5 if onset_spacing >= long_spacing_threshold else 0.0),
+                    (prev_start, 1.0 if prev_duration >= long_sustain_threshold else 0.0),
+                ):
+                    if weight <= 0.0:
+                        continue
+                    if abs(at - target) > search_radius:
+                        continue
+                    if at - boundaries[-1] < min_segment:
+                        continue
+                    if phrase_end - at < beat_dur * 0.5:
+                        continue
+                    closeness = max(0.0, 1.0 - (abs(at - target) / search_radius))
+                    candidates.append((weight + closeness, at))
+            return candidates
+
+        target = phrase_start + target_segment
+        while target < phrase_end - min_segment:
+            candidates = boundary_candidates(target)
+            if candidates:
+                _score, at = max(candidates, key=lambda item: item[0])
+                boundaries.append(at)
+            elif target - boundaries[-1] >= min_segment:
+                boundaries.append(target)
+            target = boundaries[-1] + target_segment
 
         boundaries.append(phrase_end)
 

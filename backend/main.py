@@ -34,6 +34,7 @@ from core.basic_pitch_runner import (
 from core.chord_detection import detect_chords
 from core.elevenlabs_choir import generate_choir_audio
 from core.key_detection import detect_key
+from core.melody_cleanup import clean_melody_notes
 from core.midi_refiner import refine_midi
 from core.musicxml_builder import build_musicxml
 from core.voice_assignment import assign_voices
@@ -70,6 +71,7 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         tempo = estimate_tempo_from_notes(notes)
 
         key_name, key_mode = detect_key(notes)
+        notes = clean_melody_notes(notes, key_name, key_mode, tempo)
 
         db.execute(
             "UPDATE sessions SET status='notes_ready', key_name=?, key_mode=?, tempo=?, bpm_librosa=? WHERE id=?",
@@ -118,6 +120,7 @@ def run_harmonization(session_id: str) -> None:
         harmony_lead = filter_lead_notes(harmony_lead, window=11)
         harmony_lead = merge_nearby(harmony_lead, gap_ms=120.0)
         harmony_lead = quantize_to_scale(harmony_lead, key_name, key_mode)
+        harmony_lead = clean_melody_notes(harmony_lead, key_name, key_mode, tempo)
 
         # Coarse rhythmic grid for chord alignment (8th/16th based on tempo feel).
         beat_sec = 60.0 / max(tempo, 1)
@@ -544,7 +547,10 @@ async def export_midi(session_id: str):
     import mido
 
     db = get_db()
-    session = db.execute("SELECT tempo FROM sessions WHERE id=?", (session_id,)).fetchone()
+    session = db.execute(
+        "SELECT tempo, key_name, key_mode FROM sessions WHERE id=?",
+        (session_id,),
+    ).fetchone()
     melody = db.execute("SELECT notes FROM melodies WHERE session_id=?", (session_id,)).fetchone()
     arrangement = db.execute(
         "SELECT soprano, alto, tenor, bass FROM arrangements WHERE session_id=?",
@@ -557,6 +563,12 @@ async def export_midi(session_id: str):
 
     tempo = int(session["tempo"] or 120)
     melody_notes = json.loads(melody["notes"]) if melody else []
+    melody_notes = clean_melody_notes(
+        melody_notes,
+        session["key_name"] or None,
+        session["key_mode"] or None,
+        tempo,
+    )
     s = json.loads(arrangement["soprano"])
     a = json.loads(arrangement["alto"])
     t = json.loads(arrangement["tenor"])
@@ -571,48 +583,48 @@ async def export_midi(session_id: str):
 
     def _lead_to_chord_aware_grid(notes: list[dict], chord_notes: list[dict]) -> list[dict]:
         """
-        Arrangement MIDI only: smooth the lead into one averaged pitch per
-        8th-note slot, then merge stable repeated pitch across longer chord
-        spans into quarters/halves when appropriate.
+        Arrangement MIDI only: keep the lead note placement from the audio, then
+        lightly quantize to a small grid. This preserves real gaps instead of
+        rebuilding the melody into artificial fixed 8th-note buckets.
         """
         if not notes:
             return []
         beat_sec = 60.0 / max(1, tempo)
-        eighth_sec = beat_sec / 2
+        sixteenth_sec = beat_sec / 4
         quarter_sec = beat_sec
         half_sec = beat_sec * 2
-        end_time = max(float(n["start_time"]) + float(n["duration"]) for n in notes)
-        slots = max(1, int(end_time / eighth_sec) + 1)
         grid_notes: list[dict] = []
 
-        for i in range(slots):
-            start = i * eighth_sec
-            end = start + eighth_sec
-            overlaps = []
-            for n in notes:
-                n_start = float(n["start_time"])
-                n_end = n_start + float(n["duration"])
-                overlap = max(0.0, min(end, n_end) - max(start, n_start))
-                if overlap > 0:
-                    overlaps.append((n, overlap))
-
-            if not overlaps:
-                continue
-
-            weight_sum = sum(w for _n, w in overlaps)
-            avg_pitch = sum(float(n["pitch"]) * w for n, w in overlaps) / weight_sum
-            pitch = int(round(avg_pitch))
-
+        for n in sorted(notes, key=lambda item: float(item["start_time"])):
+            start_raw = float(n["start_time"])
+            end_raw = start_raw + float(n["duration"])
+            start = round(start_raw / sixteenth_sec) * sixteenth_sec
+            end = round(end_raw / sixteenth_sec) * sixteenth_sec
+            if end <= start:
+                end = start + max(sixteenth_sec, float(n["duration"]))
             grid_notes.append(
                 {
-                    "pitch": pitch,
+                    "pitch": int(round(n["pitch"])),
                     "start_time": start,
-                    "duration": eighth_sec,
+                    "duration": max(sixteenth_sec, end - start),
                 }
             )
 
         if not grid_notes:
             return []
+
+        # Resolve accidental overlaps without closing intentional rests.
+        non_overlapping: list[dict] = []
+        for note in grid_notes:
+            prev = non_overlapping[-1] if non_overlapping else None
+            if prev:
+                prev_end = float(prev["start_time"]) + float(prev["duration"])
+                if float(note["start_time"]) < prev_end:
+                    prev["duration"] = max(sixteenth_sec, float(note["start_time"]) - float(prev["start_time"]))
+                    if prev["duration"] <= sixteenth_sec * 0.55:
+                        non_overlapping.pop()
+            non_overlapping.append(dict(note))
+        grid_notes = non_overlapping
 
         # Chord spans come from SATB sustained notes (all voices share timing).
         chord_spans = sorted(
@@ -671,13 +683,104 @@ async def export_midi(session_id: str):
             )
         return out
 
-    def add_track(name: str, notes: list[dict], velocity: int = 80, include_tempo: bool = False):
+    def _is_consonant_with_lead(harmony_pitch: int, lead_pitch: int) -> bool:
+        interval = abs(harmony_pitch - lead_pitch) % 12
+        # Treat seconds, sevenths, and tritone as clashes against the lead.
+        return interval in {0, 3, 4, 5, 7, 8, 9}
+
+    def _dominant_lead_pitch(start: float, end: float) -> int | None:
+        overlaps = []
+        for n in lead_export:
+            n_start = float(n["start_time"])
+            n_end = n_start + float(n["duration"])
+            overlap = max(0.0, min(end, n_end) - max(start, n_start))
+            if overlap > 0:
+                overlaps.append((int(round(n["pitch"])), overlap))
+        if not overlaps:
+            return None
+        return max(overlaps, key=lambda item: item[1])[0]
+
+    def _nearest_consonant_chord_tone(
+        original_pitch: int,
+        lead_pitch: int,
+        chord_pcs: set[int],
+        voice_range: tuple[int, int],
+    ) -> int | None:
+        lo, hi = voice_range
+        candidates = [
+            pc + (12 * octave)
+            for pc in chord_pcs
+            for octave in range(0, 9)
+            if lo <= pc + (12 * octave) <= hi
+            and _is_consonant_with_lead(pc + (12 * octave), lead_pitch)
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda pitch: abs(pitch - original_pitch))
+
+    def _sanitize_harmony_against_lead(
+        voices: dict[str, list[dict]],
+    ) -> dict[str, list[dict]]:
+        ranges = {
+            "soprano": (60, 79),
+            "alto": (55, 74),
+            "tenor": (48, 69),
+            "bass": (40, 60),
+        }
+        entries_by_span: dict[tuple[float, float], list[tuple[str, dict]]] = {}
+        for voice, notes in voices.items():
+            for n in notes:
+                start = round(float(n["start_time"]), 4)
+                end = round(start + float(n["duration"]), 4)
+                entries_by_span.setdefault((start, end), []).append((voice, n))
+
+        cleaned = {voice: [] for voice in voices}
+        for (start, end), entries in sorted(entries_by_span.items()):
+            lead_pitch = _dominant_lead_pitch(start, end)
+            if lead_pitch is None:
+                for voice, note in entries:
+                    cleaned[voice].append(note)
+                continue
+
+            chord_pcs = {int(round(note["pitch"])) % 12 for _voice, note in entries}
+            moved_entries: list[tuple[str, dict]] = []
+            for voice, note in entries:
+                pitch = int(round(note["pitch"]))
+                if _is_consonant_with_lead(pitch, lead_pitch):
+                    moved_entries.append((voice, note))
+                    continue
+
+                moved_pitch = _nearest_consonant_chord_tone(
+                    pitch,
+                    lead_pitch,
+                    chord_pcs,
+                    ranges[voice],
+                )
+                if moved_pitch is not None:
+                    moved_entries.append((voice, {**note, "pitch": moved_pitch}))
+
+            # If the whole chord clashes with the lead, omit it rather than
+            # forcing a brittle replacement voicing into the MIDI export.
+            if moved_entries:
+                for voice, note in moved_entries:
+                    cleaned[voice].append(note)
+
+        return cleaned
+
+    def add_track(
+        name: str,
+        notes: list[dict],
+        velocity: int = 80,
+        include_tempo: bool = False,
+        channel: int = 0,
+    ):
         tr = mido.MidiTrack()
         mid.tracks.append(tr)
         tr.append(mido.MetaMessage("track_name", name=name, time=0))
         tr.append(mido.MetaMessage("instrument_name", name=name, time=0))
         if include_tempo:
             tr.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo), time=0))
+        tr.append(mido.Message("program_change", channel=channel, program=52, time=0))
         events = []
         for n in notes:
             p = int(round(n["pitch"]))
@@ -688,7 +791,15 @@ async def export_midi(session_id: str):
         events.sort(key=lambda e: (e[0], 0 if e[1] == "note_off" else 1))
         cur = 0
         for tick, kind, pitch, vel in events:
-            tr.append(mido.Message(kind, note=pitch, velocity=vel, time=tick - cur))
+            tr.append(
+                mido.Message(
+                    kind,
+                    note=pitch,
+                    velocity=vel,
+                    channel=channel,
+                    time=tick - cur,
+                )
+            )
             cur = tick
 
     # Arrangement MIDI only: lead becomes averaged 8th-note melody.
@@ -698,13 +809,25 @@ async def export_midi(session_id: str):
     alto_export = _align_chord_entries_to_lead(a)
     tenor_export = _align_chord_entries_to_lead(t)
     bass_export = _align_chord_entries_to_lead(b)
+    sanitized_harmony = _sanitize_harmony_against_lead(
+        {
+            "soprano": sop_export,
+            "alto": alto_export,
+            "tenor": tenor_export,
+            "bass": bass_export,
+        }
+    )
+    sop_export = sanitized_harmony["soprano"]
+    alto_export = sanitized_harmony["alto"]
+    tenor_export = sanitized_harmony["tenor"]
+    bass_export = sanitized_harmony["bass"]
 
-    # Required order: Lead, Soprano, Alto, Tenor, Bass
-    add_track("Lead", lead_export, 88, include_tempo=True)
-    add_track("Soprano", sop_export, 82)
-    add_track("Alto", alto_export, 76)
-    add_track("Tenor", tenor_export, 74)
-    add_track("Bass", bass_export, 72)
+    # Required order and labels: Lead, Sop, Alto, Tenor, Bass.
+    add_track("Lead", lead_export, 88, include_tempo=True, channel=0)
+    add_track("Sop", sop_export, 82, channel=1)
+    add_track("Alto", alto_export, 76, channel=2)
+    add_track("Tenor", tenor_export, 74, channel=3)
+    add_track("Bass", bass_export, 72, channel=4)
 
     buffer = io.BytesIO()
     mid.save(file=buffer)
