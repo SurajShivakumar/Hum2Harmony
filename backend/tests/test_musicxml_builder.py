@@ -24,9 +24,14 @@ def test_build_musicxml_contains_header():
     assert "score-partwise" in xml
 
 
-def test_build_musicxml_has_four_parts():
+def test_build_musicxml_has_expected_parts():
     xml = build_musicxml(_make_parts(), key="C", tempo=120)
-    assert xml.count('<part id="P') == 4
+    # Export now includes Lead + Piano RH/LH + SATB (7 parts total).
+    assert xml.count('<score-part id="P') == 7
+    assert xml.count('\n<part id="P') == 7
+    assert "Lead" in xml
+    assert "Piano RH" in xml
+    assert "Piano LH" in xml
     assert "Soprano" in xml
     assert "Alto" in xml
     assert "Tenor" in xml

@@ -10,8 +10,8 @@ import {
   harmonizeSession,
 } from "@/lib/api";
 import type { NoteEvent, SessionStatus } from "@/lib/api";
+import type { MidiExportNote } from "@/lib/midiExportNote";
 import { notesToRawMidiUri } from "@/lib/midiWriter";
-import type { Note } from "@/lib/basicPitch";
 import PianoRoll from "@/components/PianoRoll";
 import NotePlayer from "@/components/NotePlayer";
 
@@ -21,7 +21,7 @@ function midiToName(midi: number): string {
   return `${NOTE_NAMES[p % 12]}${Math.floor(p / 12) - 1}`;
 }
 
-function toExportNotes(notes: NoteEvent[]): Note[] {
+function toExportNotes(notes: NoteEvent[]): MidiExportNote[] {
   return notes.map((n) => ({
     pitchMidi: Math.round(n.pitch),
     startTimeSeconds: n.start_time,

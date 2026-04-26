@@ -70,7 +70,6 @@ export default function Home() {
           </div>
 
           <UploadZone onFile={handleFile} />
-<<<<<<< HEAD
 
           <div className="w-full rounded-2xl border border-fuchsia-200 bg-white/80 p-5 shadow-sm text-left space-y-2">
             <p className="text-sm font-semibold text-gray-800">Text → singing AI</p>
@@ -85,8 +84,6 @@ export default function Home() {
               Open text-to-sing workspace →
             </Link>
           </div>
-=======
->>>>>>> 821b525cbf15088ddce180abea142d9f9ad51dc3
         </div>
       )}
 

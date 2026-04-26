@@ -30,13 +30,10 @@ export interface SessionData {
   tempo: number;
   /** Global BPM from librosa on the raw audio (can differ from `tempo`). */
   bpm_librosa: number | null;
-<<<<<<< HEAD
-  /** True when the session’s source file exists (e.g. TTS MP3 or upload). */
-  source_audio_ready?: boolean;
-=======
   /** Present when `status` is `failed` — server-side reason (debugging). */
   error?: string | null;
->>>>>>> 821b525cbf15088ddce180abea142d9f9ad51dc3
+  /** True when the session's source file exists (e.g. TTS MP3 or upload). */
+  source_audio_ready?: boolean;
   notes: NoteEvent[];
   chords: ChordEvent[];
   parts: {
@@ -92,7 +89,22 @@ export async function harmonizeSession(sessionId: string): Promise<void> {
   if (!res.ok) throw new Error(`Harmonize failed: ${res.status}`);
 }
 
-<<<<<<< HEAD
+/** Save the current piano-roll notes and start harmonization in one request. */
+export async function harmonizeSessionWithNotes(
+  sessionId: string,
+  notes: NoteEvent[]
+): Promise<void> {
+  const res = await fetch(`${BASE}/harmonize/${sessionId}/notes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(notes),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Harmonize failed: ${res.status}`);
+  }
+}
+
 // ── Text → ElevenLabs → transcribe (separate from hum upload) ────────────────
 
 export async function textSing(lyrics: string): Promise<{ session_id: string; status: string }> {
@@ -137,22 +149,24 @@ export interface MelodyVoiceStatusResponse {
 
 export async function startMelodyVoice(sessionId: string): Promise<MelodyVoiceStatusResponse> {
   const res = await fetch(`${BASE}/melody-voice/${sessionId}`, { method: "POST" });
-=======
-/** Save the current piano-roll notes and start harmonization in one request. */
-export async function harmonizeSessionWithNotes(
-  sessionId: string,
-  notes: NoteEvent[]
-): Promise<void> {
-  const res = await fetch(`${BASE}/harmonize/${sessionId}/notes`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(notes),
-  });
->>>>>>> 821b525cbf15088ddce180abea142d9f9ad51dc3
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error((body as { detail?: string }).detail ?? `Harmonize failed: ${res.status}`);
+    throw new Error((body as { detail?: string }).detail ?? `Melody voice failed: ${res.status}`);
   }
+  return res.json();
+}
+
+export async function getMelodyVoiceStatus(sessionId: string): Promise<MelodyVoiceStatusResponse> {
+  const res = await fetch(`${BASE}/melody-voice/${sessionId}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Melody voice status failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export function melodyVoiceAudioUrl(sessionId: string): string {
+  return `${BASE}/melody-voice/audio/${sessionId}`;
 }
 
 // ── MIDI refinement ──────────────────────────────────────────────────────────

@@ -9,7 +9,8 @@ def _make_note(pitch: int, start: float, duration: float = 0.5) -> dict:
 
 def test_build_diatonic_chords_c_major():
     chords = build_diatonic_chords(0, "major")  # C major
-    assert len(chords) == 5
+    # Current implementation returns all 7 diatonic triads (I through vii°).
+    assert len(chords) == 7
     # I chord should be C (root_pc=0) with pitch classes [0, 4, 7]
     assert chords[0]["root_pc"] == 0
     assert set(chords[0]["pitch_classes"]) == {0, 4, 7}
