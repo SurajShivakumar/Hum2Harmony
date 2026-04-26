@@ -69,7 +69,7 @@ export default function MelodyVoicePlayer({ sessionId }: Props) {
             AI Voice Preview
           </p>
           <p className="text-xs text-gray-400">
-            ElevenLabs sings your melody back in "dom" syllables
+            ElevenLabs sings your melody with connected legato "ahhh" vowels
           </p>
         </div>
 

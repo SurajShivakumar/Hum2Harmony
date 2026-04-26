@@ -1,9 +1,13 @@
 """
 MusicXML 3.1 builder.
 
-Generates a valid score-partwise file with four labeled staves (SATB).
-All parts share the same time signature (4/4) and tempo. Divisions = 4
-(one division = one sixteenth note), so a quarter note = 4 divisions.
+Exports a synced arrangement with:
+  - Lead melody
+  - Piano RH/LH reduction
+  - SATB sustained harmony staves
+
+Unlike the previous implementation, this version preserves measure-relative
+timing (rests, simultaneous notes/chords) so MuseScore playback stays aligned.
 """
 
 KEY_FIFTHS: dict[str, int] = {
@@ -39,20 +43,47 @@ def _dur_type(duration_seconds: float, tempo: int) -> tuple[str, int]:
     return type_name, max(divs, 1)
 
 
-def _build_note(note: dict, tempo: int) -> str:
+def _type_from_divs(divs: int) -> str:
+    # Reverse lookup with nearest fallback
+    by_divs = {int(k * DIVISIONS_PER_QUARTER): v for k, v in DURATION_MAP.items()}
+    if divs in by_divs:
+        return by_divs[divs]
+    nearest = min(by_divs.keys(), key=lambda k: abs(k - divs))
+    return by_divs[nearest]
+
+
+def _build_note(note: dict, tempo: int, chord: bool = False, override_divs: int | None = None) -> str:
     pitch = note["pitch"]
     name_str = NOTE_NAMES_XML[pitch % 12]
     step = name_str.replace("#", "")
     alter = 1 if "#" in name_str else 0
     octave = (pitch // 12) - 1
-    type_name, divs = _dur_type(note["duration"], tempo)
+    if override_divs is None:
+        type_name, divs = _dur_type(note["duration"], tempo)
+    else:
+        divs = max(1, int(override_divs))
+        type_name = _type_from_divs(divs)
 
     alter_xml = f"<alter>{alter}</alter>" if alter else ""
+    chord_xml = "<chord/>" if chord else ""
     return (
         f"\n    <note>"
+        f"{chord_xml}"
         f"<pitch><step>{step}</step>{alter_xml}<octave>{octave}</octave></pitch>"
         f"<duration>{divs}</duration>"
         f"<type>{type_name}</type>"
+        f"</note>"
+    )
+
+
+def _build_rest(divs: int) -> str:
+    if divs <= 0:
+        return ""
+    return (
+        f"\n    <note>"
+        f"<rest/>"
+        f"<duration>{divs}</duration>"
+        f"<type>{_type_from_divs(divs)}</type>"
         f"</note>"
     )
 
@@ -69,14 +100,71 @@ def _group_into_measures(notes: list[dict], tempo: int, measure_beats: int = 4) 
     for n in notes:
         idx = min(int(n["start_time"] / measure_dur), num - 1)
         buckets[idx].append(n)
-    return [b for b in buckets if b] or [[]]
+    return buckets
 
 
-def _build_part(pid: str, notes: list[dict], fifths: int, tempo: int, clef_sign: str = "G", clef_line: int = 2) -> str:
-    measures = _group_into_measures(notes, tempo)
+def _measure_note_groups(
+    notes: list[dict], tempo: int, measure_start: float, measure_end: float
+) -> list[tuple[int, int, list[dict]]]:
+    """
+    Return grouped events: (start_div, duration_div, notes_at_same_start).
+    Notes are clamped to the measure and grouped by quantized start division.
+    """
+    quarter_secs = 60.0 / max(tempo, 1)
+    measure_notes = [n for n in notes if measure_start <= n["start_time"] < measure_end]
+    groups: dict[int, list[dict]] = {}
+    durs: dict[int, int] = {}
+
+    for n in measure_notes:
+        start_rel = max(0.0, n["start_time"] - measure_start)
+        end_abs = min(measure_end, n["start_time"] + n["duration"])
+        dur = max(0.05, end_abs - n["start_time"])
+        start_quarters = start_rel / quarter_secs
+        dur_quarters = dur / quarter_secs
+        start_div = int(round(start_quarters * DIVISIONS_PER_QUARTER))
+        dur_div = max(1, int(round(dur_quarters * DIVISIONS_PER_QUARTER)))
+        groups.setdefault(start_div, []).append(n)
+        durs[start_div] = max(durs.get(start_div, 1), dur_div)
+
+    ordered = []
+    for start_div in sorted(groups.keys()):
+        # chord notes from high to low for cleaner notation
+        same_start = sorted(groups[start_div], key=lambda n: n["pitch"], reverse=True)
+        ordered.append((start_div, durs[start_div], same_start))
+    return ordered
+
+
+def _build_part(
+    pid: str,
+    notes: list[dict],
+    fifths: int,
+    tempo: int,
+    total_measures: int,
+    clef_sign: str = "G",
+    clef_line: int = 2,
+) -> str:
+    quarter_secs = 60.0 / max(tempo, 1)
+    measure_dur = quarter_secs * 4
+    measure_divs = int(4 * DIVISIONS_PER_QUARTER)
     measures_xml = ""
-    for i, measure_notes in enumerate(measures):
-        notes_xml = "".join(_build_note(n, tempo) for n in measure_notes)
+    for i in range(total_measures):
+        start = i * measure_dur
+        end = (i + 1) * measure_dur
+        groups = _measure_note_groups(notes, tempo, start, end)
+        notes_xml = ""
+        cursor = 0
+        for start_div, dur_div, chord_notes in groups:
+            if start_div > cursor:
+                notes_xml += _build_rest(start_div - cursor)
+            # first note
+            notes_xml += _build_note(chord_notes[0], tempo, chord=False, override_divs=dur_div)
+            # simultaneous notes
+            for ch in chord_notes[1:]:
+                notes_xml += _build_note(ch, tempo, chord=True, override_divs=dur_div)
+            cursor = max(cursor, start_div + dur_div)
+        if cursor < measure_divs:
+            notes_xml += _build_rest(measure_divs - cursor)
+
         attr_xml = ""
         if i == 0:
             attr_xml = (
@@ -96,17 +184,20 @@ def build_musicxml(parts: dict[str, list[dict]], key: str, tempo: int) -> str:
     """
     Build a complete MusicXML 3.1 score-partwise document.
 
-    parts  — dict with keys 'soprano', 'alto', 'tenor', 'bass'
+    parts  — dict with keys 'soprano', 'alto', 'tenor', 'bass', 'lead', 'piano_rh', 'piano_lh'
     key    — root note name e.g. 'C', 'G', 'F'
     tempo  — BPM integer
     """
     fifths = KEY_FIFTHS.get(key, 0)
 
     voice_config = [
-        ("P1", "Soprano", "soprano", "G", 2),
-        ("P2", "Alto",    "alto",    "G", 2),
-        ("P3", "Tenor",   "tenor",   "G", 2),  # 8vb clef simplified to treble
-        ("P4", "Bass",    "bass",    "F", 4),
+        ("P1", "Lead",     "lead",     "G", 2),
+        ("P2", "Piano RH", "piano_rh", "G", 2),
+        ("P3", "Piano LH", "piano_lh", "F", 4),
+        ("P4", "Soprano",  "soprano",  "G", 2),
+        ("P5", "Alto",     "alto",     "G", 2),
+        ("P6", "Tenor",    "tenor",    "G", 2),
+        ("P7", "Bass",     "bass",     "F", 4),
     ]
 
     part_list_xml = "\n".join(
@@ -114,8 +205,27 @@ def build_musicxml(parts: dict[str, list[dict]], key: str, tempo: int) -> str:
         for pid, name, _, _, _ in voice_config
     )
 
+    # keep all parts aligned by measure count derived from the longest part
+    all_notes = []
+    for _pid, _name, voice, _cs, _cl in voice_config:
+        all_notes.extend(parts.get(voice, []))
+    if all_notes:
+        end_time = max(n["start_time"] + n["duration"] for n in all_notes)
+        quarter_secs = 60.0 / max(tempo, 1)
+        total_measures = max(1, int(end_time / (quarter_secs * 4)) + 1)
+    else:
+        total_measures = 1
+
     parts_xml = "".join(
-        _build_part(pid, parts[voice], fifths, tempo, clef_sign, clef_line)
+        _build_part(
+            pid,
+            parts.get(voice, []),
+            fifths,
+            tempo,
+            total_measures,
+            clef_sign,
+            clef_line,
+        )
         for pid, _name, voice, clef_sign, clef_line in voice_config
     )
 

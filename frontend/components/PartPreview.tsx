@@ -15,15 +15,12 @@ interface PartPreviewProps {
 }
 
 const VOICES = ["soprano", "alto", "tenor", "bass"] as const;
-const VOICE_COLORS: Record<(typeof VOICES)[number], string> = {
-  soprano: "bg-violet-100 text-violet-800",
-  alto: "bg-pink-100 text-pink-800",
-  tenor: "bg-blue-100 text-blue-800",
-  bass: "bg-emerald-100 text-emerald-800",
-};
-
 export default function PartPreview({ keyName, tempo, chords, parts }: PartPreviewProps) {
   const chordNames = chords.map((c) => c.chord_name);
+  const voiceAtTime = (voice: (typeof VOICES)[number], t: number) => {
+    const n = parts[voice].find((x) => x.start_time <= t && (x.start_time + x.duration) > t);
+    return n?.note_name ?? "—";
+  };
 
   return (
     <div className="w-full space-y-6">
@@ -47,44 +44,34 @@ export default function PartPreview({ keyName, tempo, chords, parts }: PartPrevi
         </div>
       </div>
 
-      {/* Part table */}
+      {/* Chord-aligned SATB table */}
       <div className="overflow-x-auto rounded-xl border border-gray-200 shadow-sm">
         <table className="min-w-full text-sm font-mono">
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
-              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider w-24">
-                Voice
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                Measure
               </th>
               <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">
-                Notes (first 16)
+                Chord
               </th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">S</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">A</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">T</th>
+              <th className="px-4 py-3 text-left text-xs font-semibold text-gray-500 uppercase tracking-wider">B</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {VOICES.map((voice) => {
-              const notes = parts[voice].slice(0, 16);
-              return (
-                <tr key={voice} className="hover:bg-gray-50 transition-colors">
-                  <td className="px-4 py-3">
-                    <span
-                      className={`inline-block px-2 py-0.5 rounded text-xs font-semibold uppercase ${VOICE_COLORS[voice]}`}
-                    >
-                      {voice}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-gray-700 whitespace-nowrap">
-                    {notes.map((n, i) => (
-                      <span key={i} className="mr-2">
-                        {n.note_name}
-                      </span>
-                    ))}
-                    {parts[voice].length > 16 && (
-                      <span className="text-gray-400">…</span>
-                    )}
-                  </td>
-                </tr>
-              );
-            })}
+            {chords.slice(0, 16).map((c, i) => (
+              <tr key={i} className="hover:bg-gray-50 transition-colors">
+                <td className="px-4 py-3 text-gray-500">{i + 1}</td>
+                <td className="px-4 py-3 text-gray-700">{c.chord_name}</td>
+                <td className="px-4 py-3 text-violet-700">{voiceAtTime("soprano", c.start_time)}</td>
+                <td className="px-4 py-3 text-pink-700">{voiceAtTime("alto", c.start_time)}</td>
+                <td className="px-4 py-3 text-blue-700">{voiceAtTime("tenor", c.start_time)}</td>
+                <td className="px-4 py-3 text-emerald-700">{voiceAtTime("bass", c.start_time)}</td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>

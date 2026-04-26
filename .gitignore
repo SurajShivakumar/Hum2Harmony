@@ -19,6 +19,8 @@ env/
 
 # FastAPI / uvicorn
 *.log
+backend/.env
+backend/audio_files/
 
 # Node / Next.js
 frontend/node_modules/
@@ -36,3 +38,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+
+# Local third-party/native checkout
+vendor/NeuralNote/

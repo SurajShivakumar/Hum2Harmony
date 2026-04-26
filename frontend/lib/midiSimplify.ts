@@ -160,12 +160,26 @@ function removePitchOutliers(
 ): NoteEvent[] {
   if (notes.length < 3) return notes;
   const pitches = notes.map(n => n.pitch);
-  return notes.filter((_, i) => {
+  const medianFiltered = notes.filter((_, i) => {
     const lo = Math.max(0, i - windowHalf);
     const hi = Math.min(notes.length, i + windowHalf + 1);
     const slice = pitches.slice(lo, hi).slice().sort((a, b) => a - b);
     const median = slice[Math.floor(slice.length / 2)];
     return Math.abs(pitches[i] - median) <= maxDev;
+  });
+
+  // Second pass: remove isolated octave spikes between stable neighbours.
+  if (medianFiltered.length < 3) return medianFiltered;
+  return medianFiltered.filter((n, i, arr) => {
+    if (i === 0 || i === arr.length - 1) return true;
+    const prev = arr[i - 1];
+    const next = arr[i + 1];
+    const jumpPrev = Math.abs(n.pitch - prev.pitch);
+    const jumpNext = Math.abs(n.pitch - next.pitch);
+    const neighGap = Math.abs(prev.pitch - next.pitch);
+    const isolatedSpike = jumpPrev >= 12 && jumpNext >= 12 && neighGap <= 4;
+    if (!isolatedSpike) return true;
+    return n.duration >= 0.25; // keep only if it's a clearly sustained leap
   });
 }
 

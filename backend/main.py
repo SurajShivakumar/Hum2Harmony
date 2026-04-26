@@ -3,7 +3,7 @@ Hum to Harmony — real FastAPI application.
 
 Three-phase pipeline:
   POST /upload              → store audio file, create session
-  POST /analyze/{id}        → run Basic Pitch, store notes          (background)
+  POST /analyze/{id}        → run transcription, store notes        (background)
   POST /harmonize/{id}      → chord detection + SATB + MusicXML    (background)
   GET  /session/{id}        → poll status + results
   GET  /export/{id}         → download MusicXML
@@ -23,7 +23,14 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from core.basic_pitch_runner import transcribe_audio, estimate_tempo_from_notes, quantize_to_scale
+from core.basic_pitch_runner import (
+    transcribe_audio,
+    estimate_tempo_from_notes,
+    quantize_to_scale,
+    monophonize,
+    filter_lead_notes,
+    merge_nearby,
+)
 from core.chord_detection import detect_chords
 from core.elevenlabs_choir import generate_choir_audio
 from core.key_detection import detect_key
@@ -54,7 +61,7 @@ CHOIR_PARTS = ("soprano", "alto", "tenor", "bass", "mixed")
 # ---------------------------------------------------------------------------
 
 def run_transcription(session_id: str, audio_path: str) -> None:
-    """Phase 1: Basic Pitch transcription only."""
+    """Phase 1: NeuralNote/Basic Pitch transcription only."""
     db = get_db()
     try:
         notes, bpm_librosa = transcribe_audio(audio_path)
@@ -104,8 +111,28 @@ def run_harmonization(session_id: str) -> None:
         db.execute("UPDATE sessions SET status='harmonizing' WHERE id=?", (session_id,))
         db.commit()
 
-        chords = detect_chords(notes, tempo, key_name, key_mode)
-        parts = assign_voices(notes, chords)
+        # Heavily filtered lead stream for harmony generation only.
+        # Keep raw notes untouched in DB for "Raw MIDI" export.
+        harmony_lead = sorted(notes, key=lambda n: n["start_time"])
+        harmony_lead = monophonize(harmony_lead)
+        harmony_lead = filter_lead_notes(harmony_lead, window=11)
+        harmony_lead = merge_nearby(harmony_lead, gap_ms=120.0)
+        harmony_lead = quantize_to_scale(harmony_lead, key_name, key_mode)
+
+        # Coarse rhythmic grid for chord alignment (8th/16th based on tempo feel).
+        beat_sec = 60.0 / max(tempo, 1)
+        grid = beat_sec / 2 if tempo < 110 else beat_sec / 4
+        for n in harmony_lead:
+            st = round(float(n["start_time"]) / grid) * grid
+            en = round(float(n["end_time"]) / grid) * grid
+            if en <= st:
+                en = st + grid
+            n["start_time"] = round(st, 4)
+            n["end_time"] = round(en, 4)
+            n["duration"] = round(en - st, 4)
+
+        chords = detect_chords(harmony_lead, tempo, key_name, key_mode)
+        parts = assign_voices(harmony_lead, chords)
         musicxml = build_musicxml(parts, key_name, tempo)
 
         db.execute(
@@ -138,7 +165,7 @@ def run_harmonization(session_id: str) -> None:
 
 @app.post("/upload")
 async def upload(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
-    """Store audio file and immediately kick off Basic Pitch transcription."""
+    """Store audio file and immediately kick off transcription."""
     session_id = str(uuid.uuid4())
     ext = os.path.splitext(audio.filename or "")[1] or ".webm"
     audio_path = os.path.join(AUDIO_DIR, f"{session_id}{ext}")
@@ -219,9 +246,6 @@ async def get_session(session_id: str):
     }
 
 
-MELODY_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # Rachel — bright soprano
-
-
 def _melody_path(session_id: str) -> str:
     return os.path.join(CHOIR_DIR, f"{session_id}_melody.wav")
 
@@ -247,7 +271,8 @@ def run_melody_synthesis(session_id: str) -> None:
             raise ValueError("No melody found — run /analyze first")
 
         notes = json.loads(melody["notes"])
-        audio = _synth_part(notes, MELODY_VOICE_ID, api_key, SAMPLE_RATE)
+        # voice is auto-chosen by melody pitch range (low->male, high->female)
+        audio = _synth_part(notes, None, api_key, SAMPLE_RATE, part_name="melody")
         with open(_melody_path(session_id), "wb") as f:
             f.write(_to_wav_bytes(audio, SAMPLE_RATE))
 
@@ -503,4 +528,188 @@ async def export(session_id: str):
         content=row["musicxml"],
         media_type="application/xml",
         headers={"Content-Disposition": "attachment; filename=arrangement.musicxml"},
+    )
+
+
+@app.get("/export-midi/{session_id}")
+async def export_midi(session_id: str):
+    """
+    Export arrangement as MIDI with:
+      - Lead melody track
+      - SATB tracks aligned to lead note onsets
+
+    MIDI order: Lead, Soprano, Alto, Tenor, Bass
+    """
+    import io
+    import mido
+
+    db = get_db()
+    session = db.execute("SELECT tempo FROM sessions WHERE id=?", (session_id,)).fetchone()
+    melody = db.execute("SELECT notes FROM melodies WHERE session_id=?", (session_id,)).fetchone()
+    arrangement = db.execute(
+        "SELECT soprano, alto, tenor, bass FROM arrangements WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    db.close()
+
+    if not session or not arrangement:
+        raise HTTPException(status_code=404, detail="Arrangement not found")
+
+    tempo = int(session["tempo"] or 120)
+    melody_notes = json.loads(melody["notes"]) if melody else []
+    s = json.loads(arrangement["soprano"])
+    a = json.loads(arrangement["alto"])
+    t = json.loads(arrangement["tenor"])
+    b = json.loads(arrangement["bass"])
+
+    ticks_per_beat = 480
+    sec_per_tick = 60.0 / (max(1, tempo) * ticks_per_beat)
+    mid = mido.MidiFile(type=1, ticks_per_beat=ticks_per_beat)
+
+    melody_notes = sorted(melody_notes, key=lambda n: float(n["start_time"]))
+    lead_onsets = [float(n["start_time"]) for n in melody_notes]
+
+    def _lead_to_chord_aware_grid(notes: list[dict], chord_notes: list[dict]) -> list[dict]:
+        """
+        Arrangement MIDI only: smooth the lead into one averaged pitch per
+        8th-note slot, then merge stable repeated pitch across longer chord
+        spans into quarters/halves when appropriate.
+        """
+        if not notes:
+            return []
+        beat_sec = 60.0 / max(1, tempo)
+        eighth_sec = beat_sec / 2
+        quarter_sec = beat_sec
+        half_sec = beat_sec * 2
+        end_time = max(float(n["start_time"]) + float(n["duration"]) for n in notes)
+        slots = max(1, int(end_time / eighth_sec) + 1)
+        grid_notes: list[dict] = []
+
+        for i in range(slots):
+            start = i * eighth_sec
+            end = start + eighth_sec
+            overlaps = []
+            for n in notes:
+                n_start = float(n["start_time"])
+                n_end = n_start + float(n["duration"])
+                overlap = max(0.0, min(end, n_end) - max(start, n_start))
+                if overlap > 0:
+                    overlaps.append((n, overlap))
+
+            if not overlaps:
+                continue
+
+            weight_sum = sum(w for _n, w in overlaps)
+            avg_pitch = sum(float(n["pitch"]) * w for n, w in overlaps) / weight_sum
+            pitch = int(round(avg_pitch))
+
+            grid_notes.append(
+                {
+                    "pitch": pitch,
+                    "start_time": start,
+                    "duration": eighth_sec,
+                }
+            )
+
+        if not grid_notes:
+            return []
+
+        # Chord spans come from SATB sustained notes (all voices share timing).
+        chord_spans = sorted(
+            [(float(n["start_time"]), float(n["start_time"]) + float(n["duration"])) for n in chord_notes],
+            key=lambda x: x[0],
+        )
+
+        def _span_for(t: float) -> tuple[float, float] | None:
+            for st, en in chord_spans:
+                if st <= t < en:
+                    return st, en
+            return None
+
+        merged: list[dict] = []
+        for note in grid_notes:
+            span = _span_for(float(note["start_time"]))
+            same_pitch = merged and merged[-1]["pitch"] == note["pitch"]
+            contiguous = merged and abs(merged[-1]["start_time"] + merged[-1]["duration"] - note["start_time"]) < 1e-6
+            same_chord_span = False
+            if merged and span:
+                prev_span = _span_for(float(merged[-1]["start_time"]))
+                same_chord_span = prev_span == span
+
+            if same_pitch and contiguous and same_chord_span:
+                # Allow stable lead tones to sustain under longer chords.
+                max_len = half_sec if span and (span[1] - span[0]) >= half_sec else quarter_sec
+                if merged[-1]["duration"] + note["duration"] <= max_len + 1e-6:
+                    merged[-1]["duration"] += note["duration"]
+                    continue
+            merged.append(dict(note))
+
+        return merged
+
+    def _snap_to_lead_onset(t: float) -> float:
+        """
+        Snap chord onsets to nearby lead onsets (if close), so harmony entries
+        line up when they come in while keeping mostly sustained chord lengths.
+        """
+        if not lead_onsets:
+            return t
+        beat_sec = 60.0 / max(1, tempo)
+        max_snap = beat_sec * 0.35
+        nearest = min(lead_onsets, key=lambda x: abs(x - t))
+        return nearest if abs(nearest - t) <= max_snap else t
+
+    def _align_chord_entries_to_lead(voice_notes: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for n in voice_notes:
+            out.append(
+                {
+                    **n,
+                    "start_time": _snap_to_lead_onset(float(n["start_time"])),
+                    # Keep sustained durations (majority full/half notes)
+                    "duration": max(0.25, float(n["duration"])),
+                }
+            )
+        return out
+
+    def add_track(name: str, notes: list[dict], velocity: int = 80, include_tempo: bool = False):
+        tr = mido.MidiTrack()
+        mid.tracks.append(tr)
+        tr.append(mido.MetaMessage("track_name", name=name, time=0))
+        tr.append(mido.MetaMessage("instrument_name", name=name, time=0))
+        if include_tempo:
+            tr.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo), time=0))
+        events = []
+        for n in notes:
+            p = int(round(n["pitch"]))
+            st = int(round(float(n["start_time"]) / sec_per_tick))
+            du = max(1, int(round(float(n["duration"]) / sec_per_tick)))
+            events.append((st, "note_on", p, velocity))
+            events.append((st + du, "note_off", p, 0))
+        events.sort(key=lambda e: (e[0], 0 if e[1] == "note_off" else 1))
+        cur = 0
+        for tick, kind, pitch, vel in events:
+            tr.append(mido.Message(kind, note=pitch, velocity=vel, time=tick - cur))
+            cur = tick
+
+    # Arrangement MIDI only: lead becomes averaged 8th-note melody.
+    # Raw/Filtered MIDI buttons are not affected.
+    lead_export = _lead_to_chord_aware_grid(melody_notes, s)
+    sop_export = _align_chord_entries_to_lead(s)
+    alto_export = _align_chord_entries_to_lead(a)
+    tenor_export = _align_chord_entries_to_lead(t)
+    bass_export = _align_chord_entries_to_lead(b)
+
+    # Required order: Lead, Soprano, Alto, Tenor, Bass
+    add_track("Lead", lead_export, 88, include_tempo=True)
+    add_track("Soprano", sop_export, 82)
+    add_track("Alto", alto_export, 76)
+    add_track("Tenor", tenor_export, 74)
+    add_track("Bass", bass_export, 72)
+
+    buffer = io.BytesIO()
+    mid.save(file=buffer)
+    return Response(
+        content=buffer.getvalue(),
+        media_type="audio/midi",
+        headers={"Content-Disposition": "attachment; filename=arrangement.mid"},
     )

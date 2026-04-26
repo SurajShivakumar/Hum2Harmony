@@ -37,7 +37,7 @@ export interface SessionData {
   };
 }
 
-/** Upload audio blob. Backend immediately kicks off Basic Pitch transcription. */
+/** Upload audio blob. Backend immediately kicks off audio-to-MIDI transcription. */
 export async function uploadAudio(blob: Blob): Promise<{ session_id: string; status: string }> {
   const form = new FormData();
   const ext = blob.type.includes("webm") ? ".webm"
@@ -146,15 +146,19 @@ export async function refineAndDownloadMidi(sessionId: string): Promise<void> {
   URL.revokeObjectURL(url);
 }
 
-/** Download the MusicXML arrangement. */
-export async function downloadArrangement(sessionId: string): Promise<void> {
-  const res = await fetch(`${BASE}/export/${sessionId}`);
-  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+/** Download the arranged MIDI (Lead + Piano + SATB). */
+export async function downloadArrangementMidi(
+  sessionId: string,
+  filename = "hum-to-harmony-arrangement.mid"
+): Promise<void> {
+  const res = await fetch(`${BASE}/export-midi/${sessionId}`);
+  if (!res.ok) throw new Error(`MIDI export failed: ${res.status}`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = "hum-to-harmony.musicxml";
+  const clean = filename.trim();
+  a.download = clean.toLowerCase().endsWith(".mid") ? clean : `${clean || "arrangement"}.mid`;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);

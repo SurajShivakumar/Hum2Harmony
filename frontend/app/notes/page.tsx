@@ -5,7 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { getSession, harmonizeSession, refineAndDownloadMidi } from "@/lib/api";
 import type { NoteEvent, SessionStatus } from "@/lib/api";
 import type { Note } from "@/lib/basicPitch";
-import { notesToMidiUri } from "@/lib/midiWriter";
+import { notesToRawMidiUri } from "@/lib/midiWriter";
+import { combineSustainArtifacts } from "@/lib/noteCleanup";
 import AudioPlayer from "@/components/AudioPlayer";
 import Waveform from "@/components/Waveform";
 import PianoRoll from "@/components/PianoRoll";
@@ -61,7 +62,7 @@ function NotesContent() {
       durationSeconds:    n.duration,
       amplitude:          0.75,
     }));
-    const uri = notesToMidiUri(basicNotes, tempo, key);
+    const uri = notesToRawMidiUri(basicNotes, tempo);
     const a = document.createElement("a");
     a.href = uri;
     a.download = "melody.mid";
@@ -96,6 +97,7 @@ function NotesContent() {
   const transcribing  = status === "transcribing";
   const notesReady    = notes.length > 0 && status !== "transcribing" && status !== "failed";
   const alreadyDone   = status === "complete";
+  const playbackNotes = combineSustainArtifacts(notes);
 
   return (
     <div className="flex flex-col gap-6 max-w-3xl mx-auto">
@@ -146,7 +148,7 @@ function NotesContent() {
                 </span>
               )}
               <span className="px-2.5 py-1 rounded-full bg-gray-100 text-gray-700 font-semibold">
-                {notes.length} notes
+                {playbackNotes.length} notes
               </span>
             </div>
           )}
@@ -156,7 +158,7 @@ function NotesContent() {
         {transcribing && (
           <div className="flex items-center gap-3 py-8 justify-center text-violet-600">
             <span className="text-2xl animate-spin">⟳</span>
-            <span className="font-medium">Basic Pitch is transcribing your melody…</span>
+            <span className="font-medium">NeuralNote is transcribing your melody...</span>
           </div>
         )}
 
@@ -170,12 +172,12 @@ function NotesContent() {
         {notesReady && (
           <div className="space-y-4">
             {/* Piano roll */}
-            <PianoRoll notes={notes} currentTime={pianoTime} />
+            <PianoRoll notes={playbackNotes} currentTime={pianoTime} />
 
             {/* MIDI playback + download row */}
             <div className="flex items-center justify-between flex-wrap gap-3">
               <NotePlayer
-                notes={notes}
+                notes={playbackNotes}
                 tempo={tempo}
                 musicalKey={key}
                 onTimeUpdate={setPianoTime}
@@ -187,7 +189,7 @@ function NotesContent() {
                   onClick={handleDownloadMidi}
                   className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl border border-gray-200 bg-white text-gray-700 text-sm font-medium hover:bg-gray-50 hover:border-gray-300 transition-all shadow-sm"
                 >
-                  ⬇ MIDI
+                  ⬇ Raw MIDI
                 </button>
 
                 {/* AI-refined MIDI */}
@@ -197,10 +199,16 @@ function NotesContent() {
                   title="Run local cleanup to improve timing, key, and melody shape"
                   className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl border border-indigo-200 bg-indigo-50 text-indigo-700 text-sm font-medium hover:bg-indigo-100 transition-all shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
                 >
-                  {refining ? <span className="animate-spin">⟳</span> : "✨"} Refined MIDI
+                  {refining ? <span className="animate-spin">⟳</span> : "✨"} Filtered MIDI
                 </button>
               </div>
             </div>
+
+            <p className="text-xs text-gray-400">
+              <span className="font-medium text-gray-500">Filtered MIDI</span> is cleaner for lead playback.
+              <span className="mx-1">·</span>
+              <span className="font-medium text-gray-500">Raw MIDI</span> keeps the original transcription for maximum accuracy.
+            </p>
 
             {refineError && (
               <p className="text-xs text-red-500">{refineError}</p>

@@ -19,6 +19,11 @@ import librosa
 import numpy as np
 from basic_pitch.inference import predict
 
+try:
+    from core.neuralnote_runner import transcribe_audio_neuralnote
+except Exception:  # pragma: no cover - keeps Basic Pitch usable during setup
+    transcribe_audio_neuralnote = None
+
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 # Force ONNX: TF 2.20 is present on this machine but incompatible with the
@@ -253,7 +258,7 @@ def estimate_bpm_librosa(wav_path: str) -> int | None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def transcribe_audio(audio_path: str) -> tuple[list[dict], int | None]:
+def _transcribe_audio_basic_pitch(audio_path: str) -> tuple[list[dict], int | None]:
     """
     Run Basic Pitch on audio_path and return post-processed notes.
 
@@ -311,3 +316,38 @@ def transcribe_audio(audio_path: str) -> tuple[list[dict], int | None]:
     notes = merge_nearby(notes)  # fuse same-pitch fragments < 60 ms apart
 
     return notes, bpm_librosa
+
+
+def transcribe_audio(audio_path: str) -> tuple[list[dict], int | None]:
+    """
+    Prefer NeuralNote's C++ transcription engine when its CLI is available.
+
+    The rest of the backend expects the same note dict shape regardless of
+    engine, so Basic Pitch remains a fallback while the native CLI is not built.
+    """
+    wav_path, converted = _to_wav(audio_path)
+    bpm_librosa: int | None = None
+    try:
+        bpm_librosa = estimate_bpm_librosa(wav_path)
+    finally:
+        if converted and os.path.exists(wav_path):
+            os.remove(wav_path)
+
+    engine = os.getenv("TRANSCRIPTION_ENGINE", "neuralnote").strip().lower()
+    if engine == "neuralnote_strict" and transcribe_audio_neuralnote is None:
+        raise RuntimeError("NeuralNote runner could not be imported")
+
+    if engine in ("neuralnote", "neuralnote_strict", "auto") and transcribe_audio_neuralnote is not None:
+        try:
+            notes = transcribe_audio_neuralnote(audio_path)
+            notes = merge_nearby(notes)
+            print(f"[transcription] engine=neuralnote notes={len(notes)}")
+            return notes, bpm_librosa
+        except Exception as exc:
+            print(f"[neuralnote] unavailable, falling back to basic-pitch: {exc}")
+            if engine == "neuralnote_strict":
+                raise
+
+    notes, fallback_bpm = _transcribe_audio_basic_pitch(audio_path)
+    print(f"[transcription] engine=basic-pitch notes={len(notes)}")
+    return notes, bpm_librosa if bpm_librosa is not None else fallback_bpm

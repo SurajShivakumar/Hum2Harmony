@@ -105,7 +105,7 @@ export default function ChoirPlayer({ sessionId }: Props) {
         <div className="flex items-center gap-3 text-violet-600 text-sm bg-violet-50 rounded-2xl px-4 py-3">
           <span className="text-xl animate-pulse">♪</span>
           <span>
-            ElevenLabs is generating each vocal part — pitch-shifting "dom" syllables to your
+            ElevenLabs is generating each vocal part — pitch-shifting "aaah" vowels to your
             melody. This usually takes 20–40 seconds.
           </span>
         </div>

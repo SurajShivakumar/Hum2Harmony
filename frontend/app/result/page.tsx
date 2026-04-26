@@ -72,7 +72,7 @@ function ResultContent() {
         <div className="space-y-1">
           <h1 className="text-3xl font-extrabold text-gray-900">Your Arrangement</h1>
           <p className="text-gray-500 text-sm">
-            Ready to open in MuseScore · 4 parts · SATB
+            Lead + Piano + SATB chord arrangement
           </p>
         </div>
         <div className="flex gap-4 text-center">

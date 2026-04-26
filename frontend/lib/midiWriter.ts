@@ -46,10 +46,21 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   const filtered = (() => {
     if (mono.length < 3) return mono;
     const pitches = mono.map(n => n.pitchMidi);
-    return mono.filter((_, i) => {
+    const medianFiltered = mono.filter((_, i) => {
       const lo = Math.max(0, i - 4), hi = Math.min(mono.length, i + 5);
       const s = pitches.slice(lo, hi).slice().sort((a, b) => a - b);
       return Math.abs(pitches[i] - s[Math.floor(s.length / 2)]) <= 9;
+    });
+    if (medianFiltered.length < 3) return medianFiltered;
+    return medianFiltered.filter((n, i, arr) => {
+      if (i === 0 || i === arr.length - 1) return true;
+      const prev = arr[i - 1], next = arr[i + 1];
+      const isolatedSpike =
+        Math.abs(n.pitchMidi - prev.pitchMidi) >= 12 &&
+        Math.abs(n.pitchMidi - next.pitchMidi) >= 12 &&
+        Math.abs(prev.pitchMidi - next.pitchMidi) <= 4;
+      if (!isolatedSpike) return true;
+      return n.durationSeconds >= 0.25;
     });
   })();
 
@@ -120,15 +131,11 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   }));
 }
 
-export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): string {
-  const bpmClean    = cleanBpm(bpm);
-  const simplified  = simplify(notes, bpmClean, musicalKey);
-  const ticksPerSec = (bpmClean / 60) * 128;
-
+function toMidiUriFromNotes(notes: Note[], bpmClean: number, ticksPerSec: number): string {
   const track = new MidiWriter.Track();
   track.setTempo(bpmClean);
 
-  for (const note of simplified) {
+  for (const note of notes) {
     track.addEvent(
       new MidiWriter.NoteEvent({
         pitch: [midiToName(note.pitchMidi)],
@@ -139,6 +146,33 @@ export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): s
     );
   }
   return new MidiWriter.Writer(track).dataUri();
+}
+
+export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): string {
+  const bpmClean    = cleanBpm(bpm);
+  const simplified  = simplify(notes, bpmClean, musicalKey);
+  const ticksPerSec = (bpmClean / 60) * 128;
+  return toMidiUriFromNotes(simplified, bpmClean, ticksPerSec);
+}
+
+/**
+ * Raw MIDI export: preserves original note density/timing as much as possible.
+ * Uses a higher tick resolution for denser timing detail.
+ */
+export function notesToRawMidiUri(notes: Note[], bpm = 120): string {
+  const bpmClean = cleanBpm(bpm);
+  const raw = [...notes]
+    .map((n) => ({
+      ...n,
+      pitchMidi: Math.round(n.pitchMidi),
+      durationSeconds: Math.max(0.02, n.durationSeconds),
+      amplitude: Math.max(0.01, Math.min(1, n.amplitude)),
+    }))
+    .sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
+
+  // Higher temporal resolution than filtered export.
+  const ticksPerSec = (bpmClean / 60) * 256;
+  return toMidiUriFromNotes(raw, bpmClean, ticksPerSec);
 }
 
 export function downloadMidi(notes: Note[], filename = "output.mid") {
