@@ -1,5 +1,5 @@
 import MidiWriter from "midi-writer-js";
-import type { Note } from "./basicPitch";
+import type { MidiExportNote } from "./midiExportNote";
 import { cleanBpm, snapDuration, snapPitchToScale, parseKey, STANDARD_BEATS } from "./midiSimplify";
 
 const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -10,10 +10,10 @@ function midiToName(midi: number): string {
 }
 
 /**
- * Same pipeline as simplifyForMidi (NoteEvent path) but for the basicPitch
- * Note type (different field names).
+ * Same pipeline as simplifyForMidi (NoteEvent path) but for MidiExportNote
+ * field names.
  */
-function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
+function simplify(notes: MidiExportNote[], bpm = 120, musicalKey?: string): MidiExportNote[] {
   if (!notes.length) return [];
 
   const bpmClean  = cleanBpm(bpm);
@@ -24,7 +24,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   // 0. Monophonize — collapse any chords/overlaps to the loudest/highest note
   const mono = (() => {
     const sorted = [...notes].sort((a, b) => a.startTimeSeconds - b.startTimeSeconds);
-    const out: Note[] = [];
+    const out: MidiExportNote[] = [];
     for (const n of sorted) {
       const prev = out[out.length - 1];
       if (!prev || n.startTimeSeconds >= prev.startTimeSeconds + prev.durationSeconds - 0.001) {
@@ -66,7 +66,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
 
   // 2. Snap pitches + merge within 1 semitone
   const snapped = filtered.map(n => ({ ...n, pitchMidi: Math.round(n.pitchMidi) }));
-  const merged: Note[] = [];
+  const merged: MidiExportNote[] = [];
   for (const n of snapped) {
     const prev = merged[merged.length - 1];
     const gap  = prev ? n.startTimeSeconds - (prev.startTimeSeconds + prev.durationSeconds) : Infinity;
@@ -93,7 +93,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
     : quantized;
 
   // 5. Merge same-pitch notes after scale snap
-  const merged2: Note[] = [];
+  const merged2: MidiExportNote[] = [];
   for (const n of scaled) {
     const prev = merged2[merged2.length - 1];
     if (prev && prev.pitchMidi === n.pitchMidi) {
@@ -108,7 +108,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   }
 
   // 7. Overlap fix + sub-16th filter
-  const result: Note[] = [];
+  const result: MidiExportNote[] = [];
   for (const n of merged2) {
     if (n.durationSeconds < sixteenth * 0.5) continue;
     const prev = result[result.length - 1];
@@ -131,7 +131,7 @@ function simplify(notes: Note[], bpm = 120, musicalKey?: string): Note[] {
   }));
 }
 
-function toMidiUriFromNotes(notes: Note[], bpmClean: number, ticksPerSec: number): string {
+function toMidiUriFromNotes(notes: MidiExportNote[], bpmClean: number, ticksPerSec: number): string {
   const track = new MidiWriter.Track();
   track.setTempo(bpmClean);
 
@@ -148,7 +148,7 @@ function toMidiUriFromNotes(notes: Note[], bpmClean: number, ticksPerSec: number
   return new MidiWriter.Writer(track).dataUri();
 }
 
-export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): string {
+export function notesToMidiUri(notes: MidiExportNote[], bpm = 120, musicalKey?: string): string {
   const bpmClean    = cleanBpm(bpm);
   const simplified  = simplify(notes, bpmClean, musicalKey);
   const ticksPerSec = (bpmClean / 60) * 128;
@@ -159,7 +159,7 @@ export function notesToMidiUri(notes: Note[], bpm = 120, musicalKey?: string): s
  * Raw MIDI export: preserves original note density/timing as much as possible.
  * Uses a higher tick resolution for denser timing detail.
  */
-export function notesToRawMidiUri(notes: Note[], bpm = 120): string {
+export function notesToRawMidiUri(notes: MidiExportNote[], bpm = 120): string {
   const bpmClean = cleanBpm(bpm);
   const raw = [...notes]
     .map((n) => ({
@@ -175,7 +175,7 @@ export function notesToRawMidiUri(notes: Note[], bpm = 120): string {
   return toMidiUriFromNotes(raw, bpmClean, ticksPerSec);
 }
 
-export function downloadMidi(notes: Note[], filename = "output.mid") {
+export function downloadMidi(notes: MidiExportNote[], filename = "output.mid") {
   const uri = notesToMidiUri(notes);
   const a = document.createElement("a");
   a.href = uri;

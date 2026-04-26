@@ -373,5 +373,5 @@ export function simplifyForMidi(
   return out;
 }
 
-/** Exported for use in the MIDI writer (Note type uses different field names). */
+/** Exported for use in the MIDI writer (MidiExportNote uses different field names than NoteEvent). */
 export { cleanBpm, snapDuration, snapPitchToScale, parseKey, STANDARD_BEATS };

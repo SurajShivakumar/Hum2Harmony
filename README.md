@@ -13,10 +13,6 @@ SATB choral arrangement you can open in MuseScore in under 60 seconds.
 cd backend
 pip install -r requirements.txt
 
-# Dev: run the mock server first so Person A can start immediately
-uvicorn mock_main:app --reload --port 8000
-
-# Production: run the real server
 uvicorn main:app --reload --port 8000
 ```
 
@@ -26,7 +22,7 @@ uvicorn main:app --reload --port 8000
 cd frontend
 npm install
 
-# Copy env and point at mock server
+# Copy env and set NEXT_PUBLIC_BACKEND_URL to match the API port
 cp ../.env.example .env.local
 
 npm run dev
@@ -37,7 +33,7 @@ npm run dev
 
 ## How It Works
 
-1. **Record** — Browser MediaRecorder captures a hummed melody (≤30 s)
+1. **Record** — Browser MediaRecorder captures a hummed melody
 2. **Transcribe** — Basic Pitch (Spotify) converts audio to MIDI note events
 3. **Detect** — Krumhansl-Schmuckler algorithm finds the key; chord segmentation finds harmonic structure
 4. **Arrange** — Rule-based voice leading assigns Soprano, Alto, Tenor, Bass parts

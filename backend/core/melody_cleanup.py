@@ -54,6 +54,97 @@ def _is_supported_chromatic_passing(prev_pitch: int, pitch: int, next_pitch: int
     return same_direction and neighbor
 
 
+def _is_octave_move(a: int, b: int) -> bool:
+    distance = abs(int(a) - int(b))
+    return distance >= 12 and distance % 12 == 0
+
+
+def _merge_or_drop_strays(notes: list[dict], tempo: int) -> list[dict]:
+    if len(notes) < 2:
+        return notes
+
+    beat_sec = 60.0 / max(1, tempo)
+    min_clear_duration = beat_sec * 0.25
+    max_stutter_gap = beat_sec * 0.25
+    out: list[dict] = []
+
+    for note in notes:
+        cur = dict(note)
+        cur["pitch"] = int(round(cur["pitch"]))
+        cur["duration"] = max(0.01, float(cur["duration"]))
+        cur["end_time"] = float(cur["start_time"]) + cur["duration"]
+
+        prev = out[-1] if out else None
+        if not prev:
+            out.append(cur)
+            continue
+
+        prev_end = float(prev["start_time"]) + float(prev["duration"])
+        gap = float(cur["start_time"]) - prev_end
+        same_or_neighbor = abs(int(prev["pitch"]) - int(cur["pitch"])) <= 1
+        octave_move = _is_octave_move(int(prev["pitch"]), int(cur["pitch"]))
+        short_note = cur["duration"] < min_clear_duration
+
+        if same_or_neighbor and gap <= max_stutter_gap:
+            new_end = max(prev_end, float(cur["end_time"]))
+            prev["duration"] = round(new_end - float(prev["start_time"]), 4)
+            prev["end_time"] = round(new_end, 4)
+            if cur.get("amplitude", 0) > prev.get("amplitude", 0):
+                prev["pitch"] = cur["pitch"]
+                prev["note_name"] = midi_to_name(cur["pitch"])
+            continue
+
+        if short_note and len(out) >= 1:
+            next_like_prev = False
+            # Let the next pass merge around this if the surrounding note is
+            # clearly more stable than the blip.
+            if (
+                gap <= max_stutter_gap
+                and abs(int(prev["pitch"]) - int(cur["pitch"])) >= 4
+                and not octave_move
+            ):
+                next_like_prev = True
+            if next_like_prev:
+                prev["duration"] = round(max(prev_end, float(cur["end_time"])) - float(prev["start_time"]), 4)
+                prev["end_time"] = round(float(prev["start_time"]) + float(prev["duration"]), 4)
+                continue
+
+        out.append(cur)
+
+    return out
+
+
+def simplify_lead_for_export(
+    notes: list[dict],
+    key_name: str | None,
+    key_mode: str | None,
+    tempo: int,
+) -> list[dict]:
+    """Produce a simpler monophonic lead for arrangement MIDI export."""
+    cleaned = clean_melody_notes(notes, key_name, key_mode, tempo)
+    if len(cleaned) < 2:
+        return cleaned
+
+    # A second cleanup after scale snapping catches tiny neighbor/stutter notes
+    # that should sound like one sustained melody tone in the exported MIDI.
+    cleaned = _merge_or_drop_strays(cleaned, tempo)
+
+    # Keep the lead in a single vocal register so score importers do not split
+    # it into piano-style upper/lower staves.
+    pitches = [int(round(n["pitch"])) for n in cleaned]
+    center = float(median(pitches))
+    out: list[dict] = []
+    for note in cleaned:
+        pitch = int(round(note["pitch"]))
+        while pitch - center > 9:
+            pitch -= 12
+        while center - pitch > 9:
+            pitch += 12
+        out.append({**note, "pitch": pitch, "note_name": midi_to_name(pitch)})
+
+    return _merge_or_drop_strays(out, tempo)
+
+
 def clean_melody_notes(
     notes: list[dict],
     key_name: str | None,
@@ -89,15 +180,21 @@ def clean_melody_notes(
             local_median = float(median(neighbor_pitches))
             nearest_neighbor = min(abs(pitch - p) for p in neighbor_pitches)
             duration = float(note.get("duration", 0.0))
-            isolated_jump = abs(pitch - local_median) >= 12 and nearest_neighbor >= 9
-            very_far_from_song = abs(pitch - global_median) >= 19
+            octave_related = any(_is_octave_move(pitch, p) for p in neighbor_pitches)
+            isolated_jump = (
+                abs(pitch - local_median) >= 17
+                and nearest_neighbor >= 12
+                and not octave_related
+            )
+            very_far_from_song = abs(pitch - global_median) >= 24
             if isolated_jump and (very_far_from_song or duration <= beat_sec * 0.6):
                 continue
 
-            # Common octave-error case: same melodic shape, wrong octave.
-            while pitch - local_median > 12:
+            # Common octave-error case: same melodic shape, clearly wrong octave.
+            # Leave moderate jumps alone so intentional low/high notes survive.
+            while pitch - local_median > 17:
                 pitch -= 12
-            while local_median - pitch > 12:
+            while local_median - pitch > 17:
                 pitch += 12
 
         note["pitch"] = pitch
@@ -133,4 +230,4 @@ def clean_melody_notes(
         snapped = _nearest_scale_pitch(pitch, scale, local_target)
         corrected.append({**note, "pitch": snapped, "note_name": midi_to_name(snapped)})
 
-    return corrected
+    return _merge_or_drop_strays(corrected, tempo)

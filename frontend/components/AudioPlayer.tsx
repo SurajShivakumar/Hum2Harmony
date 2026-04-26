@@ -5,13 +5,15 @@ import { useEffect, useRef, useState } from "react";
 interface AudioPlayerProps {
   src: string;
   label?: string;
+  onUnsupported?: () => void;
 }
 
-export default function AudioPlayer({ src, label = "Your recording" }: AudioPlayerProps) {
+export default function AudioPlayer({ src, label = "Your recording", onUnsupported }: AudioPlayerProps) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const audio = audioRef.current;
@@ -20,19 +22,27 @@ export default function AudioPlayer({ src, label = "Your recording" }: AudioPlay
     const onTimeUpdate = () => setCurrentTime(audio.currentTime);
     const onDurationChange = () => setDuration(audio.duration);
     const onEnded = () => setPlaying(false);
+    const onError = () => {
+      setPlaying(false);
+      setError("This browser cannot play the saved recording preview. You can still use the transcription.");
+      onUnsupported?.();
+    };
 
     audio.addEventListener("timeupdate", onTimeUpdate);
     audio.addEventListener("durationchange", onDurationChange);
     audio.addEventListener("loadedmetadata", onDurationChange);
     audio.addEventListener("ended", onEnded);
+    audio.addEventListener("error", onError);
+    setError(null);
 
     return () => {
       audio.removeEventListener("timeupdate", onTimeUpdate);
       audio.removeEventListener("durationchange", onDurationChange);
       audio.removeEventListener("loadedmetadata", onDurationChange);
       audio.removeEventListener("ended", onEnded);
+      audio.removeEventListener("error", onError);
     };
-  }, [src]);
+  }, [src, onUnsupported]);
 
   const toggle = async () => {
     const audio = audioRef.current;
@@ -41,8 +51,15 @@ export default function AudioPlayer({ src, label = "Your recording" }: AudioPlay
       audio.pause();
       setPlaying(false);
     } else {
-      await audio.play();
-      setPlaying(true);
+      try {
+        await audio.play();
+        setPlaying(true);
+        setError(null);
+      } catch {
+        setPlaying(false);
+        setError("This browser cannot play the saved recording preview. You can still use the transcription.");
+        onUnsupported?.();
+      }
     }
   };
 
@@ -93,6 +110,11 @@ export default function AudioPlayer({ src, label = "Your recording" }: AudioPlay
         onChange={seek}
         className="w-full h-1.5 accent-violet-600 cursor-pointer rounded-full"
       />
+      {error && (
+        <p className="text-xs text-amber-600 bg-amber-50 rounded-lg px-3 py-2">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

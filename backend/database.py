@@ -1,7 +1,10 @@
 import os
 import sqlite3
+from pathlib import Path
 
-DB_PATH = os.environ.get("DB_PATH", "hum_to_harmony.db")
+_BACKEND = Path(__file__).resolve().parent
+_DEFAULT_DB = str(_BACKEND / "hum_to_harmony.db")
+DB_PATH = os.environ.get("DB_PATH", _DEFAULT_DB)
 
 
 def get_db() -> sqlite3.Connection:
@@ -44,6 +47,11 @@ def init_db() -> None:
     # Add bpm_librosa to databases created before this column existed
     try:
         conn.execute("ALTER TABLE sessions ADD COLUMN bpm_librosa INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    try:
+        conn.execute("ALTER TABLE sessions ADD COLUMN last_error TEXT")
     except sqlite3.OperationalError as e:
         if "duplicate column" not in str(e).lower():
             raise

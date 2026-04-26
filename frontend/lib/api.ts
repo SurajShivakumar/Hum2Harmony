@@ -11,6 +11,9 @@ export interface ChordEvent {
   start_time: number;
   end_time: number;
   chord_name: string;
+  root_pc?: number;
+  pitch_classes?: number[];
+  roman?: string;
 }
 
 export type SessionStatus =
@@ -27,8 +30,13 @@ export interface SessionData {
   tempo: number;
   /** Global BPM from librosa on the raw audio (can differ from `tempo`). */
   bpm_librosa: number | null;
+<<<<<<< HEAD
   /** True when the session’s source file exists (e.g. TTS MP3 or upload). */
   source_audio_ready?: boolean;
+=======
+  /** Present when `status` is `failed` — server-side reason (debugging). */
+  error?: string | null;
+>>>>>>> 821b525cbf15088ddce180abea142d9f9ad51dc3
   notes: NoteEvent[];
   chords: ChordEvent[];
   parts: {
@@ -36,6 +44,8 @@ export interface SessionData {
     alto: NoteEvent[];
     tenor: NoteEvent[];
     bass: NoteEvent[];
+    piano_rh?: NoteEvent[];
+    piano_lh?: NoteEvent[];
   };
 }
 
@@ -59,12 +69,30 @@ export async function getSession(sessionId: string): Promise<SessionData> {
   return res.json();
 }
 
+/** Persist user-edited melody notes and clear any stale arrangement. */
+export async function updateSessionNotes(
+  sessionId: string,
+  notes: NoteEvent[]
+): Promise<Pick<SessionData, "session_id" | "status" | "key" | "tempo" | "notes">> {
+  const res = await fetch(`${BASE}/session/${sessionId}/notes`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(notes),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Save notes failed: ${res.status}`);
+  }
+  return res.json();
+}
+
 /** Trigger chord detection + SATB harmonization (session must be notes_ready). */
 export async function harmonizeSession(sessionId: string): Promise<void> {
   const res = await fetch(`${BASE}/harmonize/${sessionId}`, { method: "POST" });
   if (!res.ok) throw new Error(`Harmonize failed: ${res.status}`);
 }
 
+<<<<<<< HEAD
 // ── Text → ElevenLabs → transcribe (separate from hum upload) ────────────────
 
 export async function textSing(lyrics: string): Promise<{ session_id: string; status: string }> {
@@ -109,53 +137,22 @@ export interface MelodyVoiceStatusResponse {
 
 export async function startMelodyVoice(sessionId: string): Promise<MelodyVoiceStatusResponse> {
   const res = await fetch(`${BASE}/melody-voice/${sessionId}`, { method: "POST" });
+=======
+/** Save the current piano-roll notes and start harmonization in one request. */
+export async function harmonizeSessionWithNotes(
+  sessionId: string,
+  notes: NoteEvent[]
+): Promise<void> {
+  const res = await fetch(`${BASE}/harmonize/${sessionId}/notes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(notes),
+  });
+>>>>>>> 821b525cbf15088ddce180abea142d9f9ad51dc3
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error((body as { detail?: string }).detail ?? `Failed: ${res.status}`);
+    throw new Error((body as { detail?: string }).detail ?? `Harmonize failed: ${res.status}`);
   }
-  return res.json();
-}
-
-export async function getMelodyVoiceStatus(sessionId: string): Promise<MelodyVoiceStatusResponse> {
-  const res = await fetch(`${BASE}/melody-voice/${sessionId}`);
-  if (!res.ok) throw new Error(`Status fetch failed: ${res.status}`);
-  return res.json();
-}
-
-export function melodyVoiceAudioUrl(sessionId: string): string {
-  return `${BASE}/melody-voice/audio/${sessionId}`;
-}
-
-// ── Choir (ElevenLabs) ───────────────────────────────────────────────────────
-
-export type ChoirStatus = "idle" | "generating" | "ready" | "failed";
-
-export interface ChoirStatusResponse {
-  status: ChoirStatus;
-  parts: string[];
-  error?: string;
-}
-
-/** Kick off ElevenLabs choir synthesis for a completed arrangement. */
-export async function startChoir(sessionId: string): Promise<ChoirStatusResponse> {
-  const res = await fetch(`${BASE}/choir/${sessionId}`, { method: "POST" });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error((body as { detail?: string }).detail ?? `Choir start failed: ${res.status}`);
-  }
-  return res.json();
-}
-
-/** Poll choir synthesis status. */
-export async function getChoirStatus(sessionId: string): Promise<ChoirStatusResponse> {
-  const res = await fetch(`${BASE}/choir/${sessionId}`);
-  if (!res.ok) throw new Error(`Choir status failed: ${res.status}`);
-  return res.json();
-}
-
-/** Return the URL to stream a choir part WAV directly (for <audio> src). */
-export function choirAudioUrl(sessionId: string, part: string): string {
-  return `${BASE}/choir/audio/${sessionId}/${part}`;
 }
 
 // ── MIDI refinement ──────────────────────────────────────────────────────────

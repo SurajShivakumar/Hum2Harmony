@@ -8,7 +8,12 @@ interface RecordButtonProps {
   disabled?: boolean;
 }
 
-const MAX_DURATION_MS = 30_000;
+function formatRecordingClock(totalSeconds: number): string {
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
 
 function getSupportedMimeType(): string {
   const candidates = [
@@ -28,11 +33,10 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoStopRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const stopRecording = useCallback(() => {
     if (timerRef.current) clearInterval(timerRef.current);
-    if (autoStopRef.current) clearTimeout(autoStopRef.current);
+    timerRef.current = null;
     mediaRecorderRef.current?.stop();
     mediaRecorderRef.current?.stream.getTracks().forEach((t) => t.stop());
     setState("done");
@@ -65,8 +69,8 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
         const ext = (mimeType || "audio/webm").includes("ogg")
           ? "ogg"
           : (mimeType || "audio/webm").includes("mp4")
-          ? "m4a"
-          : "webm";
+            ? "m4a"
+            : "webm";
         const file = new File([blob], `recording.${ext}`, { type: blob.type });
         onRecorded(file);
       }
@@ -76,10 +80,7 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
     setState("recording");
 
     timerRef.current = setInterval(() => setElapsed((s) => s + 1), 1000);
-    autoStopRef.current = setTimeout(stopRecording, MAX_DURATION_MS);
-  }, [onRecordingComplete, onRecorded, stopRecording]);
-
-  const remaining = Math.max(0, 30 - elapsed);
+  }, [onRecordingComplete, onRecorded]);
 
   return (
     <div className="flex flex-col items-center gap-4">
@@ -91,8 +92,8 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
           state === "recording"
             ? "bg-red-500 focus:ring-red-400 scale-110"
             : state === "done"
-            ? "bg-gray-400 cursor-not-allowed"
-            : "bg-violet-600 hover:bg-violet-500 hover:scale-105 focus:ring-violet-400",
+              ? "bg-gray-400 cursor-not-allowed"
+              : "bg-violet-600 hover:bg-violet-500 hover:scale-105 focus:ring-violet-400",
         ].join(" ")}
         aria-label={state === "recording" ? "Stop recording" : "Start recording"}
       >
@@ -107,7 +108,9 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
           {state === "recording" ? (
             <>
               <span className="text-3xl">■</span>
-              <span className="text-sm font-mono">{remaining}s</span>
+              <span className="text-sm font-mono tabular-nums">
+                {formatRecordingClock(elapsed)}
+              </span>
             </>
           ) : (
             <span className="text-5xl">🎤</span>
@@ -116,8 +119,8 @@ export default function RecordButton({ onRecordingComplete, onRecorded, disabled
       </button>
 
       <p className="text-sm text-gray-500 text-center">
-        {state === "idle" && "Click to start recording · max 30 seconds"}
-        {state === "recording" && `Recording… ${elapsed}s / 30s — click to stop`}
+        {state === "idle" && "Click to start recording — click again to stop when you are done"}
+        {state === "recording" && `Recording… ${formatRecordingClock(elapsed)} — click to stop`}
         {state === "done" && "Recording captured ✓"}
       </p>
     </div>

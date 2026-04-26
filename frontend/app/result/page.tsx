@@ -6,7 +6,6 @@ import { getSession } from "@/lib/api";
 import type { SessionData } from "@/lib/api";
 import PartPreview from "@/components/PartPreview";
 import DownloadButton from "@/components/DownloadButton";
-import ChoirPlayer from "@/components/ChoirPlayer";
 
 function ResultContent() {
   const router = useRouter();
@@ -80,16 +79,13 @@ function ResultContent() {
             <p className="text-xs text-violet-500 font-semibold uppercase tracking-wider">Key</p>
             <p className="text-lg font-bold text-violet-700">{data.key || "—"}</p>
           </div>
-          <div className="px-4 py-3 bg-violet-50 rounded-2xl">
-            <p className="text-xs text-violet-500 font-semibold uppercase tracking-wider">Tempo (melody)</p>
+          <div
+            className="px-4 py-3 bg-violet-50 rounded-2xl"
+            title="Used for MusicXML and MIDI export"
+          >
+            <p className="text-xs text-violet-500 font-semibold uppercase tracking-wider">Tempo</p>
             <p className="text-lg font-bold text-violet-700">{data.tempo} BPM</p>
           </div>
-          {data.bpm_librosa != null && (
-            <div className="px-4 py-3 bg-emerald-50 rounded-2xl">
-              <p className="text-xs text-emerald-600 font-semibold uppercase tracking-wider">Librosa (audio)</p>
-              <p className="text-lg font-bold text-emerald-800">{data.bpm_librosa} BPM</p>
-            </div>
-          )}
         </div>
       </div>
 
@@ -107,13 +103,6 @@ function ResultContent() {
       ) : (
         <div className="bg-white rounded-3xl shadow-lg p-8 text-center text-gray-400">
           No part data available.
-        </div>
-      )}
-
-      {/* Choir audio */}
-      {hasParts && (
-        <div className="bg-white rounded-3xl shadow-lg p-8">
-          <ChoirPlayer sessionId={sessionId} />
         </div>
       )}
 
