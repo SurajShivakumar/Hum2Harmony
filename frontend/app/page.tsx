@@ -17,7 +17,6 @@ export default function Home() {
     setError(null);
     setStage("uploading");
     try {
-      // Save a local playback URL so the notes page can show the waveform
       const localUrl = URL.createObjectURL(blob);
       sessionStorage.setItem("recordingUrl", localUrl);
 
@@ -35,54 +34,45 @@ export default function Home() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-violet-50 to-indigo-50 flex flex-col items-center justify-center gap-10 p-8">
-
-      {/* Title */}
-      <div className="text-center space-y-3">
-        <h1 className="text-5xl font-extrabold text-gray-900 tracking-tight">
-          🎵 Hum to Harmony
+    <div className="flex min-h-[min(70vh,52rem)] flex-col items-center justify-center gap-12 py-4">
+      <div className="text-center space-y-4 max-w-md">
+        <h1 className="text-3xl sm:text-4xl font-bold text-slate-900 tracking-tight">
+          From hum to a full score
         </h1>
-        <p className="text-gray-500 text-lg max-w-md mx-auto">
-          Hum a melody, upload a recording, and we'll transcribe it, sing it back,
-          and arrange it into a full choral score.
+        <p className="text-slate-500 text-base sm:text-lg leading-relaxed">
+          Record or upload audio — we transcribe your line and build a choral arrangement
+          you can open in MuseScore or your DAW.
         </p>
       </div>
 
-      {/* Error banner */}
       {error && (
-        <div className="w-full max-w-md rounded-2xl border border-red-200 bg-red-50 text-red-700 px-5 py-3 text-sm">
+        <div className="w-full max-w-md rounded-2xl border border-red-200/80 bg-red-50 text-red-800 px-5 py-3 text-sm text-center">
           {error}
         </div>
       )}
 
-      {/* Uploading state */}
       {stage === "uploading" ? (
         <div className="flex flex-col items-center gap-4 text-violet-600">
-          <span className="text-5xl animate-spin">⟳</span>
+          <span className="text-4xl animate-spin" aria-hidden>
+            ⟳
+          </span>
           <p className="font-medium">Uploading and starting transcription…</p>
         </div>
       ) : (
-        <div className="flex flex-col items-center gap-6 w-full max-w-md">
-
-          {/* Record */}
+        <div className="flex flex-col items-center gap-8 w-full max-w-md">
           <RecordButton onRecordingComplete={handleBlob} />
 
-          <div className="flex items-center gap-3 w-full">
-            <div className="flex-1 h-px bg-gray-200" />
-            <span className="text-sm text-gray-400">or upload a file</span>
-            <div className="flex-1 h-px bg-gray-200" />
+          <div className="flex items-center gap-3 w-full text-slate-400">
+            <div className="flex-1 h-px bg-slate-200" />
+            <span className="text-sm">or upload a file</span>
+            <div className="flex-1 h-px bg-slate-200" />
           </div>
 
-          {/* Upload */}
           <UploadZone onFile={handleFile} />
-
         </div>
       )}
 
-      {/* Footer hint */}
-      <p className="text-xs text-gray-400 text-center max-w-sm">
-        Supports WAV, MP3, M4A, OGG, WebM · max ~30 seconds for best results
-      </p>
-    </main>
+      <p className="text-xs text-slate-400 text-center">WAV · MP3 · M4A · OGG · WebM</p>
+    </div>
   );
 }

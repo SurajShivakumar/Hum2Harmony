@@ -1,27 +1,26 @@
 import type { Metadata } from "next";
 import "./globals.css";
+import { H2HBrand } from "@/components/H2HBrand";
 
 export const metadata: Metadata = {
-  title: "Hum to Harmony",
-  description: "Hum a melody. Get a full SATB choral arrangement in seconds.",
+  title: "H2H",
+  description: "H2H — hum a melody, get a full choral score.",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en">
-      <body className="min-h-screen bg-gradient-to-br from-slate-50 via-violet-50 to-slate-100 text-gray-900 antialiased">
-        <header className="border-b border-violet-100 bg-white/70 backdrop-blur-md sticky top-0 z-10">
-          <div className="max-w-3xl mx-auto px-6 py-4 flex items-center gap-3">
-            <span className="text-2xl">🎵</span>
-            <span className="text-xl font-bold text-violet-700 tracking-tight">Hum to Harmony</span>
-            <span className="hidden sm:inline text-sm text-gray-400 ml-2">
-              AI-powered SATB arranger
-            </span>
+      <body className="min-h-screen bg-gradient-to-br from-slate-50 via-violet-50/40 to-slate-100 text-gray-900 antialiased">
+        <header className="border-b border-slate-200/60 bg-white/80 backdrop-blur-md sticky top-0 z-10">
+          <div className="max-w-4xl mx-auto px-4 sm:px-6 py-3.5 flex items-center justify-start">
+            <H2HBrand size="md" />
           </div>
         </header>
-        <main className="max-w-3xl mx-auto px-6 py-12">{children}</main>
-        <footer className="text-center text-xs text-gray-400 pb-8">
-          Built at UWB Hacks 2026 · No paid APIs · No accounts needed
+        <main className="max-w-4xl mx-auto px-4 sm:px-6 py-10 md:py-12">{children}</main>
+        <footer className="text-center text-xs text-slate-400 pb-10 max-w-4xl mx-auto px-6">
+          <span className="text-slate-500 font-medium">H2H</span>
+          <span className="mx-2">·</span>
+          <span>Built at UWB Hacks 2026</span>
         </footer>
       </body>
     </html>

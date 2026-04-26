@@ -15,8 +15,27 @@ interface PartPreviewProps {
 }
 
 const VOICES = ["soprano", "alto", "tenor", "bass"] as const;
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+function chordDisplayName(chord: ChordEvent): string {
+  const root = chord.root_pc;
+  if (root == null || !chord.pitch_classes?.length) return chord.chord_name;
+  const pcs = new Set(chord.pitch_classes.map((pc) => ((pc % 12) + 12) % 12));
+  const hasMinorThird = pcs.has((root + 3) % 12);
+  const hasMajorThird = pcs.has((root + 4) % 12);
+  const hasDimFifth = pcs.has((root + 6) % 12);
+  const hasAugFifth = pcs.has((root + 8) % 12);
+
+  let suffix = "";
+  if (hasMinorThird && hasDimFifth) suffix = "dim";
+  else if (hasMajorThird && hasAugFifth) suffix = "aug";
+  else if (hasMinorThird) suffix = "m";
+
+  return `${NOTE_NAMES[((root % 12) + 12) % 12]}${suffix}`;
+}
+
 export default function PartPreview({ keyName, tempo, chords, parts }: PartPreviewProps) {
-  const chordNames = chords.map((c) => c.chord_name);
+  const chordNames = chords.map(chordDisplayName);
   const voiceAtTime = (voice: (typeof VOICES)[number], t: number) => {
     const n = parts[voice].find((x) => x.start_time <= t && (x.start_time + x.duration) > t);
     return n?.note_name ?? "—";
@@ -65,7 +84,7 @@ export default function PartPreview({ keyName, tempo, chords, parts }: PartPrevi
             {chords.slice(0, 16).map((c, i) => (
               <tr key={i} className="hover:bg-gray-50 transition-colors">
                 <td className="px-4 py-3 text-gray-500">{i + 1}</td>
-                <td className="px-4 py-3 text-gray-700">{c.chord_name}</td>
+                <td className="px-4 py-3 text-gray-700">{chordDisplayName(c)}</td>
                 <td className="px-4 py-3 text-violet-700">{voiceAtTime("soprano", c.start_time)}</td>
                 <td className="px-4 py-3 text-pink-700">{voiceAtTime("alto", c.start_time)}</td>
                 <td className="px-4 py-3 text-blue-700">{voiceAtTime("tenor", c.start_time)}</td>

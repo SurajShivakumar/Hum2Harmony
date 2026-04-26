@@ -8,6 +8,9 @@ interface NotePlayerProps {
   tempo: number;
   musicalKey?: string;
   onTimeUpdate?: (t: number) => void;
+  seekTime?: number;
+  playRequest?: number;
+  toggleRequest?: number;
 }
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -15,81 +18,36 @@ function midiToName(midi: number): string {
   return `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
 }
 
-export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalKey, onTimeUpdate }: NotePlayerProps) {
-  const [engineReady, setEngineReady] = useState(false);
+export default function NotePlayer({
+  notes,
+  tempo: _tempo,
+  musicalKey: _musicalKey,
+  onTimeUpdate,
+  seekTime = 0,
+  playRequest = 0,
+  toggleRequest = 0,
+}: NotePlayerProps) {
   const [loading, setLoading] = useState(false);
   const [playing, setPlaying] = useState(false);
 
   const toneRef = useRef<typeof import("tone") | null>(null);
   const synthRef = useRef<import("tone").PolySynth | null>(null);
-  const analyserRef = useRef<import("tone").Analyser | null>(null);
   const scheduledIdsRef = useRef<number[]>([]);
   const rafRef = useRef<number | null>(null);
   const startedAtRef = useRef<number>(0);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const playingRef = useRef(false);
-
-  const totalDuration = notes.length
-    ? Math.max(...notes.map((n) => n.start_time + n.duration))
-    : 0;
-
-  const drawWaveform = useCallback(() => {
-    const analyser = analyserRef.current;
-    const canvas = canvasRef.current;
-    if (!analyser || !canvas) return;
-
-    const ctx2d = canvas.getContext("2d");
-    if (!ctx2d) return;
-    const width = canvas.width;
-    const height = canvas.height;
-
-    const values = analyser.getValue() as Float32Array;
-    const bufferLength = values.length;
-
-    ctx2d.fillStyle = "#f5f3ff";
-    ctx2d.fillRect(0, 0, width, height);
-    ctx2d.lineWidth = 2;
-    ctx2d.strokeStyle = "#6d28d9";
-    ctx2d.beginPath();
-
-    const sliceWidth = width / bufferLength;
-    let x = 0;
-    for (let i = 0; i < bufferLength; i++) {
-      const v = values[i] || 0;
-      const y = (0.5 + v * 0.45) * height;
-      if (i === 0) ctx2d.moveTo(x, y);
-      else ctx2d.lineTo(x, y);
-      x += sliceWidth;
-    }
-    ctx2d.lineTo(width, height / 2);
-    ctx2d.stroke();
-  }, []);
-
-  const drawIdleWaveform = useCallback(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx2d = canvas.getContext("2d");
-    if (!ctx2d) return;
-    const width = canvas.width;
-    const height = canvas.height;
-    ctx2d.fillStyle = "#f5f3ff";
-    ctx2d.fillRect(0, 0, width, height);
-    ctx2d.strokeStyle = "#c4b5fd";
-    ctx2d.lineWidth = 1;
-    ctx2d.beginPath();
-    ctx2d.moveTo(0, height / 2);
-    ctx2d.lineTo(width, height / 2);
-    ctx2d.stroke();
-  }, []);
+  const lastPlayRequestRef = useRef(0);
+  const lastToggleRequestRef = useRef(0);
+  const notesRef = useRef<NoteEvent[]>(notes);
+  const onTimeUpdateRef = useRef<((t: number) => void) | undefined>(onTimeUpdate);
+  notesRef.current = notes;
+  onTimeUpdateRef.current = onTimeUpdate;
 
   const ensureEngine = useCallback(async () => {
     if (synthRef.current && toneRef.current) return;
 
     const Tone = await import("tone");
     toneRef.current = Tone;
-
-    const analyser = new Tone.Analyser("waveform", 1024);
-    analyserRef.current = analyser;
 
     const volume = new Tone.Volume(-8);
     const reverb = new Tone.Reverb({ decay: 1.4, wet: 0.12 });
@@ -103,9 +61,8 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
       },
     });
 
-    synth.chain(volume, reverb, analyser, Tone.Destination);
+    synth.chain(volume, reverb, Tone.Destination);
     synthRef.current = synth;
-    setEngineReady(true);
   }, []);
 
   const stop = useCallback(async () => {
@@ -123,12 +80,15 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
     rafRef.current = null;
     playingRef.current = false;
     setPlaying(false);
-    drawIdleWaveform();
-    onTimeUpdate?.(-1);
-  }, [onTimeUpdate, drawIdleWaveform]);
+    onTimeUpdateRef.current?.(-1);
+  }, []);
 
-  const play = useCallback(async () => {
-    if (!notes.length) return;
+  const play = useCallback(async (startAt = 0) => {
+    const n = notesRef.current;
+    if (!n.length) return;
+    const totalDuration = n.length
+      ? Math.max(...n.map((x) => x.start_time + x.duration))
+      : 0;
     setLoading(true);
     await ensureEngine();
     const Tone = toneRef.current;
@@ -137,22 +97,28 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
     await Tone.start();
     await stop();
 
-    // Play raw transcription polyphonically: overlapping notes are allowed.
-    const sorted = [...notes].sort((a, b) => a.start_time - b.start_time);
+    const offset = Math.max(0, Math.min(startAt, totalDuration));
+    // Play raw transcription from the requested offset.
+    const sorted = [...n].sort((a, b) => a.start_time - b.start_time);
     for (const n of sorted) {
+      const noteStart = Math.max(0, n.start_time);
+      const noteEnd = noteStart + Math.max(0.03, n.duration);
+      if (noteEnd <= offset) continue;
+      const scheduledAt = Math.max(0, noteStart - offset);
+      const duration = Math.max(0.03, noteEnd - Math.max(noteStart, offset));
       const id = Tone.Transport.schedule((time) => {
         synth.triggerAttackRelease(
           midiToName(Math.round(n.pitch)),
-          Math.max(0.03, n.duration),
+          duration,
           time,
           0.7
         );
-      }, Math.max(0, n.start_time));
+      }, scheduledAt);
       scheduledIdsRef.current.push(id);
     }
 
     Tone.Transport.start("+0.03");
-    startedAtRef.current = performance.now();
+    startedAtRef.current = performance.now() - offset * 1000;
     playingRef.current = true;
     setPlaying(true);
     setLoading(false);
@@ -160,26 +126,43 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
     const tick = () => {
       if (!playingRef.current) return;
       const elapsed = (performance.now() - startedAtRef.current) / 1000;
-      onTimeUpdate?.(elapsed);
-      drawWaveform();
+      onTimeUpdateRef.current?.(elapsed);
       if (elapsed >= totalDuration + 0.5) {
-        stop();
+        void stop();
         return;
       }
       rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
-  }, [notes, totalDuration, ensureEngine, stop, onTimeUpdate, drawWaveform]);
+  }, [ensureEngine, stop]);
+
+  const playRef = useRef(play);
+  playRef.current = play;
+  const stopRef = useRef(stop);
+  stopRef.current = stop;
 
   useEffect(() => {
-    drawIdleWaveform();
+    if (playRequest === 0 || playRequest === lastPlayRequestRef.current) return;
+    lastPlayRequestRef.current = playRequest;
+    void playRef.current(seekTime);
+  }, [playRequest, seekTime]);
+
+  useEffect(() => {
+    if (toggleRequest === 0 || toggleRequest === lastToggleRequestRef.current) return;
+    lastToggleRequestRef.current = toggleRequest;
+    if (playingRef.current) {
+      void stopRef.current();
+    } else {
+      void playRef.current(seekTime);
+    }
+  }, [seekTime, toggleRequest]);
+
+  useEffect(() => {
     return () => {
-      stop();
+      void stop();
       synthRef.current?.dispose();
-      analyserRef.current?.dispose();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [drawIdleWaveform]);
+  }, [stop]);
 
   const statusLabel = loading
     ? "Loading instrument…"
@@ -190,7 +173,7 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
   return (
     <div className="flex items-center gap-3 flex-wrap">
       <button
-        onClick={playing ? stop : play}
+        onClick={playing ? stop : () => play(seekTime)}
         disabled={loading || !notes.length}
         className={[
           "flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-sm shadow transition-all focus:outline-none focus:ring-2 focus:ring-offset-2",
@@ -203,17 +186,6 @@ export default function NotePlayer({ notes, tempo: _tempo, musicalKey: _musicalK
         {loading && <span className="animate-spin">⟳</span>}
         {statusLabel}
       </button>
-
-      {engineReady && !playing && (
-        <span className="text-xs text-gray-400">Polyphonic synth playback</span>
-      )}
-
-      <canvas
-        ref={canvasRef}
-        width={300}
-        height={56}
-        className="rounded-lg border border-violet-100 bg-violet-50"
-      />
     </div>
   );
 }

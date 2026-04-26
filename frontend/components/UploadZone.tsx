@@ -76,7 +76,7 @@ export default function UploadZone({ onFileSelected, onFile, disabled }: UploadZ
       <span className="text-4xl">📁</span>
       <div className="text-center">
         <p className="font-medium text-gray-700">Drop an audio file here</p>
-        <p className="text-sm text-gray-500 mt-1">WAV · MP3 · M4A — max 30 seconds</p>
+        <p className="text-sm text-gray-500 mt-1">WAV · MP3 · M4A · OGG · WebM</p>
       </div>
       {error && <p className="text-sm text-red-500">{error}</p>}
     </div>

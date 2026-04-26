@@ -13,6 +13,7 @@ requests>=2.31.0
 # Local MIDI refinement
 mido>=1.3.0
 python-dotenv>=1.0.0
+music21>=9.9.1
 
 # ffmpeg must be installed separately on the system:
 #   Windows: winget install ffmpeg   OR   choco install ffmpeg

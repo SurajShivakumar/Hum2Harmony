@@ -15,11 +15,15 @@ Run:
 import json
 import os
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()  # loads .env in the backend directory
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+# Resolve paths to this package (works no matter the process CWD, e.g. `uvicorn` from repo root).
+BACKEND_DIR = Path(__file__).resolve().parent
+load_dotenv(BACKEND_DIR / ".env")
+
+from fastapi import BackgroundTasks, Body, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
@@ -34,7 +38,7 @@ from core.basic_pitch_runner import (
 from core.chord_detection import detect_chords
 from core.elevenlabs_choir import generate_choir_audio
 from core.key_detection import detect_key
-from core.melody_cleanup import clean_melody_notes
+from core.melody_cleanup import clean_melody_notes, midi_to_name, simplify_lead_for_export
 from core.midi_refiner import refine_midi
 from core.musicxml_builder import build_musicxml
 from core.voice_assignment import assign_voices
@@ -48,8 +52,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-AUDIO_DIR  = "audio_files"
-CHOIR_DIR  = os.path.join(AUDIO_DIR, "choir")
+AUDIO_DIR = str(BACKEND_DIR / "audio_files")
+CHOIR_DIR = str(BACKEND_DIR / "audio_files" / "choir")
 os.makedirs(AUDIO_DIR, exist_ok=True)
 os.makedirs(CHOIR_DIR, exist_ok=True)
 init_db()
@@ -71,11 +75,11 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         tempo = estimate_tempo_from_notes(notes)
 
         key_name, key_mode = detect_key(notes)
-        notes = clean_melody_notes(notes, key_name, key_mode, tempo)
 
+        bpm_for_db = int(bpm_librosa) if bpm_librosa is not None else None
         db.execute(
-            "UPDATE sessions SET status='notes_ready', key_name=?, key_mode=?, tempo=?, bpm_librosa=? WHERE id=?",
-            (key_name, key_mode, tempo, bpm_librosa, session_id),
+            "UPDATE sessions SET status='notes_ready', key_name=?, key_mode=?, tempo=?, bpm_librosa=?, last_error=NULL WHERE id=?",
+            (key_name, key_mode, tempo, bpm_for_db, session_id),
         )
         db.execute(
             "INSERT INTO melodies VALUES (?, ?, ?)",
@@ -84,8 +88,12 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         db.commit()
 
     except Exception as exc:
-        print(f"[transcription] session={session_id} error: {exc}")
-        db.execute("UPDATE sessions SET status='failed' WHERE id=?", (session_id,))
+        err = f"{type(exc).__name__}: {exc}"
+        print(f"[transcription] session={session_id} error: {err}")
+        db.execute(
+            "UPDATE sessions SET status='failed', last_error=? WHERE id=?",
+            (err, session_id),
+        )
         db.commit()
     finally:
         db.close()
@@ -111,6 +119,7 @@ def run_harmonization(session_id: str) -> None:
         key_mode = session.get("key_mode") or "major"
 
         db.execute("UPDATE sessions SET status='harmonizing' WHERE id=?", (session_id,))
+        db.execute("DELETE FROM arrangements WHERE session_id=?", (session_id,))
         db.commit()
 
         # Heavily filtered lead stream for harmony generation only.
@@ -134,6 +143,9 @@ def run_harmonization(session_id: str) -> None:
             n["end_time"] = round(en, 4)
             n["duration"] = round(en - st, 4)
 
+        # Use the legacy chord detector for more varied, melody-sensitive changes.
+        # Music21 is useful for theory checks, but its Roman-numeral scoring was
+        # over-preferring tonic chords on short hummed melodies.
         chords = detect_chords(harmony_lead, tempo, key_name, key_mode)
         parts = assign_voices(harmony_lead, chords)
         musicxml = build_musicxml(parts, key_name, tempo)
@@ -155,8 +167,12 @@ def run_harmonization(session_id: str) -> None:
         db.commit()
 
     except Exception as exc:
-        print(f"[harmonization] session={session_id} error: {exc}")
-        db.execute("UPDATE sessions SET status='failed' WHERE id=?", (session_id,))
+        err = f"{type(exc).__name__}: {exc}"
+        print(f"[harmonization] session={session_id} error: {err}")
+        db.execute(
+            "UPDATE sessions SET status='failed', last_error=? WHERE id=?",
+            (err, session_id),
+        )
         db.commit()
     finally:
         db.close()
@@ -165,6 +181,67 @@ def run_harmonization(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
+
+def _normalize_edited_notes(notes: list[dict]) -> tuple[list[dict], int, str, str]:
+    if not notes:
+        raise HTTPException(status_code=400, detail="At least one note is required")
+
+    normalized: list[dict] = []
+    for raw in notes:
+        try:
+            pitch = max(0, min(127, int(round(float(raw["pitch"])))))
+            start = max(0.0, float(raw["start_time"]))
+            duration = max(0.03, float(raw["duration"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid note: {raw}") from exc
+
+        normalized.append(
+            {
+                "note_name": midi_to_name(pitch),
+                "pitch": pitch,
+                "start_time": round(start, 4),
+                "end_time": round(start + duration, 4),
+                "duration": round(duration, 4),
+                "amplitude": float(raw.get("amplitude", 0.75)),
+            }
+        )
+
+    normalized.sort(key=lambda n: float(n["start_time"]))
+    tempo = estimate_tempo_from_notes(normalized)
+    key_name, key_mode = detect_key(normalized)
+    return normalized, tempo, key_name, key_mode
+
+
+def _save_edited_notes(
+    db,
+    session_id: str,
+    notes: list[dict],
+    allow_harmonizing: bool = False,
+) -> tuple[list[dict], int, str, str]:
+    normalized, tempo, key_name, key_mode = _normalize_edited_notes(notes)
+
+    row = db.execute("SELECT id, status FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if row["status"] == "harmonizing" and not allow_harmonizing:
+        raise HTTPException(status_code=409, detail="Harmony is already being generated")
+
+    melody = db.execute(
+        "SELECT session_id FROM melodies WHERE session_id=?", (session_id,)
+    ).fetchone()
+    if not melody:
+        raise HTTPException(status_code=400, detail="No melody found for session")
+
+    db.execute(
+        "UPDATE melodies SET notes=? WHERE session_id=?",
+        (json.dumps(normalized), session_id),
+    )
+    db.execute("DELETE FROM arrangements WHERE session_id=?", (session_id,))
+    db.execute(
+        "UPDATE sessions SET status='notes_ready', key_name=?, key_mode=?, tempo=?, last_error=NULL WHERE id=?",
+        (key_name, key_mode, tempo, session_id),
+    )
+    return normalized, tempo, key_name, key_mode
 
 @app.post("/upload")
 async def upload(background_tasks: BackgroundTasks, audio: UploadFile = File(...)):
@@ -197,8 +274,26 @@ async def harmonize(session_id: str, background_tasks: BackgroundTasks):
     db.close()
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
-    if row["status"] not in ("notes_ready",):
+    if row["status"] not in ("notes_ready", "complete"):
         raise HTTPException(status_code=400, detail=f"Cannot harmonize from status: {row['status']}")
+
+    background_tasks.add_task(run_harmonization, session_id)
+    return {"session_id": session_id, "status": "harmonizing"}
+
+
+@app.post("/harmonize/{session_id}/notes")
+async def harmonize_with_notes(
+    session_id: str,
+    background_tasks: BackgroundTasks,
+    notes: list[dict] = Body(...),
+):
+    """Save the current piano-roll notes, then trigger harmonization."""
+    db = get_db()
+    try:
+        _save_edited_notes(db, session_id, notes, allow_harmonizing=True)
+        db.commit()
+    finally:
+        db.close()
 
     background_tasks.add_task(run_harmonization, session_id)
     return {"session_id": session_id, "status": "harmonizing"}
@@ -225,11 +320,17 @@ async def get_session(session_id: str):
     parts: dict = {}
     if arrangement:
         chords = json.loads(arrangement["chords"])
+        soprano = json.loads(arrangement["soprano"])
+        alto = json.loads(arrangement["alto"])
+        tenor = json.loads(arrangement["tenor"])
+        bass = json.loads(arrangement["bass"])
         parts = {
-            "soprano": json.loads(arrangement["soprano"]),
-            "alto": json.loads(arrangement["alto"]),
-            "tenor": json.loads(arrangement["tenor"]),
-            "bass": json.loads(arrangement["bass"]),
+            "soprano": soprano,
+            "alto": alto,
+            "tenor": tenor,
+            "bass": bass,
+            "piano_rh": sorted(soprano + alto, key=lambda n: (n["start_time"], n["pitch"])),
+            "piano_lh": sorted(tenor + bass, key=lambda n: (n["start_time"], n["pitch"])),
         }
 
     key_str = " ".join(
@@ -243,9 +344,29 @@ async def get_session(session_id: str):
         "key": key_str,
         "tempo": session.get("tempo") or 120,
         "bpm_librosa": int(bpm) if bpm is not None else None,
+        "error": session.get("last_error"),
         "notes": notes,
         "chords": chords,
         "parts": parts,
+    }
+
+
+@app.put("/session/{session_id}/notes")
+async def update_session_notes(session_id: str, notes: list[dict] = Body(...)):
+    """Persist user-edited melody notes and invalidate the old arrangement."""
+    db = get_db()
+    try:
+        normalized, tempo, key_name, key_mode = _save_edited_notes(db, session_id, notes)
+        db.commit()
+    finally:
+        db.close()
+
+    return {
+        "session_id": session_id,
+        "status": "notes_ready",
+        "key": f"{key_name} {key_mode}",
+        "tempo": tempo,
+        "notes": normalized,
     }
 
 
@@ -563,7 +684,7 @@ async def export_midi(session_id: str):
 
     tempo = int(session["tempo"] or 120)
     melody_notes = json.loads(melody["notes"]) if melody else []
-    melody_notes = clean_melody_notes(
+    melody_notes = simplify_lead_for_export(
         melody_notes,
         session["key_name"] or None,
         session["key_mode"] or None,
@@ -777,10 +898,10 @@ async def export_midi(session_id: str):
         tr = mido.MidiTrack()
         mid.tracks.append(tr)
         tr.append(mido.MetaMessage("track_name", name=name, time=0))
-        tr.append(mido.MetaMessage("instrument_name", name=name, time=0))
         if include_tempo:
             tr.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(tempo), time=0))
-        tr.append(mido.Message("program_change", channel=channel, program=52, time=0))
+        # Acoustic Grand Piano. Keep track names separate for score import.
+        tr.append(mido.Message("program_change", channel=channel, program=0, time=0))
         events = []
         for n in notes:
             p = int(round(n["pitch"]))
@@ -802,7 +923,7 @@ async def export_midi(session_id: str):
             )
             cur = tick
 
-    # Arrangement MIDI only: lead becomes averaged 8th-note melody.
+    # Arrangement MIDI only: lead becomes a simplified vocal melody.
     # Raw/Filtered MIDI buttons are not affected.
     lead_export = _lead_to_chord_aware_grid(melody_notes, s)
     sop_export = _align_chord_entries_to_lead(s)
