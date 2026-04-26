@@ -66,6 +66,13 @@ CHOIR_PARTS = ("soprano", "alto", "tenor", "bass", "mixed")
 
 class TextSingRequest(BaseModel):
     lyrics: str = Field(..., min_length=1, max_length=4000)
+    style_prompt: str = Field(default="", max_length=1000)
+
+
+class TextSingRegenerateRequest(BaseModel):
+    edit_prompt: str = Field(..., min_length=1, max_length=1000)
+    lyrics: str | None = Field(default=None, max_length=4000)
+    style_prompt: str | None = Field(default=None, max_length=1000)
 
 
 class MelodyNoteIn(BaseModel):
@@ -129,6 +136,23 @@ def _elevenlabs_music_compose(
         raise RuntimeError(f"ElevenLabs Music failed ({resp.status_code}): {detail}")
     yield from resp.iter_content(chunk_size=64 * 1024)
 
+
+def _build_music_prompt(lyrics: str, style_prompt: str, edit_prompt: str = "") -> str:
+    direction = style_prompt.strip() or "simple pop ballad, warm, melodic, steady tempo"
+    edit = edit_prompt.strip()
+
+    parts = [
+        "Create an original short song with a clear, normal human lead vocal singing the provided lyrics.",
+        "Use a regular mid-range voice, not chipmunk, not spoken word, not narration.",
+        "Keep the arrangement sparse enough that the lead vocal melody is easy to detect for MIDI transcription.",
+        "Do not add extra words beyond the lyrics.",
+        f"Music direction: ({direction})",
+    ]
+    if edit:
+        parts.append(f"Revision request: ({edit})")
+    parts.append(f"Lyrics:\n{lyrics.strip()}")
+    return " ".join(parts)
+
 def run_transcription(session_id: str, audio_path: str) -> None:
     """Phase 1: NeuralNote/Basic Pitch transcription only."""
     db = get_db()
@@ -141,6 +165,7 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         key_name, key_mode = detect_key(notes)
 
         bpm_for_db = int(bpm_librosa) if bpm_librosa is not None else None
+        db.execute("DELETE FROM melodies WHERE session_id=?", (session_id,))
         db.execute(
             "UPDATE sessions SET status='notes_ready', key_name=?, key_mode=?, tempo=?, bpm_librosa=?, last_error=NULL WHERE id=?",
             (key_name, key_mode, tempo, bpm_for_db, session_id),
@@ -163,14 +188,21 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         db.close()
 
 
-def run_text_sing(session_id: str, lyrics: str) -> None:
+def run_text_sing(
+    session_id: str,
+    lyrics: str,
+    style_prompt: str = "",
+    edit_prompt: str = "",
+    parent_generation_id: str | None = None,
+) -> None:
     """
     Generate actual music/vocals using ElevenLabs Music, then transcribe the
     resulting audio into editable notes for MIDI export / harmony.
     """
     api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
     text = lyrics.strip()[:3000]
-    path = os.path.join(AUDIO_DIR, f"{session_id}_music.mp3")
+    generation_id = str(uuid.uuid4())
+    path = os.path.join(AUDIO_DIR, f"{session_id}_{generation_id}_music.mp3")
 
     try:
         if not api_key:
@@ -179,13 +211,7 @@ def run_text_sing(session_id: str, lyrics: str) -> None:
             raise ValueError("Empty lyrics")
 
         duration_ms = _music_duration_ms(text)
-        prompt = (
-            "Create an original short song with a clear, normal human lead vocal singing "
-            "the provided lyrics. Use a regular mid-range voice, not chipmunk, not spoken "
-            "word, not narration. Keep the arrangement sparse so the vocal melody is easy "
-            "to detect for MIDI transcription. Do not add extra words beyond the lyrics. "
-            f"Style: simple pop ballad, warm, melodic, steady tempo. Lyrics:\n{text}"
-        )
+        prompt = _build_music_prompt(text, style_prompt, edit_prompt)
 
         with open(path, "wb") as f:
             for chunk in _elevenlabs_music_compose(prompt, api_key, duration_ms):
@@ -193,15 +219,38 @@ def run_text_sing(session_id: str, lyrics: str) -> None:
                     f.write(chunk)
 
         db = get_db()
+        db.execute("DELETE FROM arrangements WHERE session_id=?", (session_id,))
+        db.execute("DELETE FROM melodies WHERE session_id=?", (session_id,))
+        db.execute(
+            """
+            INSERT INTO music_generations (
+                id, session_id, lyrics, style_prompt, edit_prompt, prompt, audio_path, parent_generation_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                generation_id,
+                session_id,
+                text,
+                style_prompt.strip(),
+                edit_prompt.strip(),
+                prompt,
+                path,
+                parent_generation_id,
+            ),
+        )
         db.execute("UPDATE sessions SET audio_path=? WHERE id=?", (path, session_id))
         db.commit()
         db.close()
 
         run_transcription(session_id, path)
     except Exception as exc:
-        print(f"[text-sing] session={session_id} error: {exc}")
+        err = f"{type(exc).__name__}: {exc}"
+        print(f"[text-sing] session={session_id} error: {err}")
         db = get_db()
-        db.execute("UPDATE sessions SET status='failed' WHERE id=?", (session_id,))
+        db.execute(
+            "UPDATE sessions SET status='failed', last_error=? WHERE id=?",
+            (err, session_id),
+        )
         db.commit()
         db.close()
 
@@ -394,8 +443,120 @@ async def text_sing(req: TextSingRequest, background_tasks: BackgroundTasks):
     db.commit()
     db.close()
 
-    background_tasks.add_task(run_text_sing, session_id, req.lyrics)
+    background_tasks.add_task(run_text_sing, session_id, req.lyrics, req.style_prompt)
     return {"session_id": session_id, "status": "transcribing"}
+
+
+@app.post("/text-sing/{session_id}/regenerate")
+async def regenerate_text_sing(
+    session_id: str,
+    req: TextSingRegenerateRequest,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Create a new music generation for the same session from an edit request.
+
+    ElevenLabs Music does not expose public inpainting/editing here, so this
+    creates a fresh version using prior lyrics/style plus the user's revision.
+    """
+    if not os.getenv("ELEVENLABS_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="ELEVENLABS_API_KEY is not set. Add it to backend/.env",
+        )
+
+    db = get_db()
+    session = db.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not session:
+        db.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    latest = db.execute(
+        """
+        SELECT id, lyrics, style_prompt
+        FROM music_generations
+        WHERE session_id=?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    db.execute(
+        "UPDATE sessions SET status='transcribing', last_error=NULL WHERE id=?",
+        (session_id,),
+    )
+    db.commit()
+    db.close()
+
+    lyrics = (req.lyrics if req.lyrics is not None else (latest["lyrics"] if latest else "")).strip()
+    style_prompt = (
+        req.style_prompt
+        if req.style_prompt is not None
+        else (latest["style_prompt"] if latest else "")
+    ).strip()
+    if not lyrics:
+        raise HTTPException(status_code=400, detail="No lyrics found for this song")
+
+    background_tasks.add_task(
+        run_text_sing,
+        session_id,
+        lyrics,
+        style_prompt,
+        req.edit_prompt,
+        latest["id"] if latest else None,
+    )
+    return {"session_id": session_id, "status": "transcribing"}
+
+
+@app.get("/text-sing/{session_id}/generations")
+async def get_text_sing_generations(session_id: str):
+    db = get_db()
+    rows = db.execute(
+        """
+        SELECT id, lyrics, style_prompt, edit_prompt, prompt, audio_path, parent_generation_id, created_at
+        FROM music_generations
+        WHERE session_id=?
+        ORDER BY created_at DESC
+        """,
+        (session_id,),
+    ).fetchall()
+    session = db.execute("SELECT audio_path FROM sessions WHERE id=?", (session_id,)).fetchone()
+    db.close()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    current_path = session["audio_path"]
+    return {
+        "generations": [
+            {
+                "id": row["id"],
+                "lyrics": row["lyrics"],
+                "style_prompt": row["style_prompt"],
+                "edit_prompt": row["edit_prompt"],
+                "prompt": row["prompt"],
+                "created_at": row["created_at"],
+                "parent_generation_id": row["parent_generation_id"],
+                "is_current": row["audio_path"] == current_path,
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/text-sing/generations/{generation_id}/audio")
+async def get_text_sing_generation_audio(generation_id: str):
+    db = get_db()
+    row = db.execute(
+        "SELECT audio_path FROM music_generations WHERE id=?",
+        (generation_id,),
+    ).fetchone()
+    db.close()
+    if not row or not row["audio_path"] or not os.path.isfile(row["audio_path"]):
+        raise HTTPException(status_code=404, detail="Generation audio not found")
+    return FileResponse(
+        row["audio_path"],
+        media_type="audio/mpeg",
+        filename=os.path.basename(row["audio_path"]),
+    )
 
 
 @app.get("/session/{session_id}/source-audio")

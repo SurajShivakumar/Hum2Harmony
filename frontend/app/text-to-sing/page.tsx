@@ -8,6 +8,7 @@ import { textSing } from "@/lib/api";
 export default function TextToSingPage() {
   const router = useRouter();
   const [lyrics, setLyrics] = useState("");
+  const [stylePrompt, setStylePrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -20,7 +21,7 @@ export default function TextToSingPage() {
     setError(null);
     setBusy(true);
     try {
-      const { session_id } = await textSing(text);
+      const { session_id } = await textSing(text, stylePrompt.trim());
       router.push(`/text-to-sing/melody?id=${session_id}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not start");
@@ -57,7 +58,7 @@ export default function TextToSingPage() {
 
       <div className="w-full max-w-lg space-y-3">
         <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider">
-          Lyrics or phrase
+          Lyrics
         </label>
         <textarea
           value={lyrics}
@@ -70,6 +71,24 @@ export default function TextToSingPage() {
         <p className="text-xs text-gray-500">
           Shorter lines work best for clear vocals and better MIDI extraction. Music generation
           requires a paid ElevenLabs plan.
+        </p>
+      </div>
+
+      <div className="w-full max-w-lg space-y-3">
+        <label className="block text-xs font-medium text-gray-500 uppercase tracking-wider">
+          Music direction <span className="normal-case text-gray-400">(genre / mood / background)</span>
+        </label>
+        <textarea
+          value={stylePrompt}
+          onChange={(e) => setStylePrompt(e.target.value)}
+          disabled={busy}
+          rows={4}
+          placeholder="e.g. (sad acoustic guitar, soft piano, slow tempo, intimate bedroom pop)"
+          className="w-full rounded-2xl border border-fuchsia-200 bg-white px-4 py-3 text-gray-800 shadow-sm outline-none focus:ring-2 focus:ring-fuchsia-200 disabled:opacity-60"
+        />
+        <p className="text-xs text-gray-500">
+          Put extra detail here instead of in lyrics. Parentheses are fine:
+          {" "}<span className="font-mono">(happy pop, drums, bright synths)</span>.
         </p>
       </div>
 

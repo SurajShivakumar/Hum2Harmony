@@ -105,19 +105,65 @@ export async function harmonizeSessionWithNotes(
   }
 }
 
-// ── Text → ElevenLabs → transcribe (separate from hum upload) ────────────────
+// ── Text → ElevenLabs Music → transcribe (separate from hum upload) ──────────
 
-export async function textSing(lyrics: string): Promise<{ session_id: string; status: string }> {
+export interface MusicGeneration {
+  id: string;
+  lyrics: string;
+  style_prompt: string;
+  edit_prompt: string;
+  prompt: string;
+  created_at: string;
+  parent_generation_id: string | null;
+  is_current: boolean;
+}
+
+export async function textSing(
+  lyrics: string,
+  stylePrompt = ""
+): Promise<{ session_id: string; status: string }> {
   const res = await fetch(`${BASE}/text-sing`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ lyrics }),
+    body: JSON.stringify({ lyrics, style_prompt: stylePrompt }),
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error((body as { detail?: string }).detail ?? `Text sing failed: ${res.status}`);
   }
   return res.json();
+}
+
+export async function regenerateTextSing(
+  sessionId: string,
+  editPrompt: string,
+  options?: { lyrics?: string; stylePrompt?: string }
+): Promise<{ session_id: string; status: string }> {
+  const res = await fetch(`${BASE}/text-sing/${sessionId}/regenerate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      edit_prompt: editPrompt,
+      lyrics: options?.lyrics,
+      style_prompt: options?.stylePrompt,
+    }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Regenerate failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function getTextSingGenerations(sessionId: string): Promise<MusicGeneration[]> {
+  const res = await fetch(`${BASE}/text-sing/${sessionId}/generations`);
+  if (!res.ok) throw new Error(`Generations fetch failed: ${res.status}`);
+  const body = await res.json();
+  return (body as { generations?: MusicGeneration[] }).generations ?? [];
+}
+
+export function textSingGenerationAudioUrl(generationId: string): string {
+  return `${BASE}/text-sing/generations/${generationId}/audio`;
 }
 
 /** AI-generated or uploaded source track for a session. */

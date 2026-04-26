@@ -1,15 +1,18 @@
 "use client";
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
+  getTextSingGenerations,
   getSession,
+  harmonizeSessionWithNotes,
+  regenerateTextSing,
   updateSessionMelody,
   sourceAudioUrl,
-  harmonizeSession,
+  textSingGenerationAudioUrl,
 } from "@/lib/api";
-import type { NoteEvent, SessionStatus } from "@/lib/api";
+import type { MusicGeneration, NoteEvent, SessionStatus } from "@/lib/api";
 import type { MidiExportNote } from "@/lib/midiExportNote";
 import { notesToRawMidiUri } from "@/lib/midiWriter";
 import PianoRoll from "@/components/PianoRoll";
@@ -40,11 +43,23 @@ function MelodyEditorContent() {
   const [keyStr, setKeyStr] = useState("");
   const [tempo, setTempo] = useState(120);
   const [pianoTime, setPianoTime] = useState(-1);
+  const [playbackStartAt, setPlaybackStartAt] = useState(0);
+  const [playRequest, setPlayRequest] = useState(0);
+  const [toggleRequest, setToggleRequest] = useState(0);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const [harmBusy, setHarmBusy] = useState(false);
+  const [arranging, setArranging] = useState(false);
   const [sourceAudioReady, setSourceAudioReady] = useState(false);
   const [audioError, setAudioError] = useState(false);
+  const [editPrompt, setEditPrompt] = useState("");
+  const [generations, setGenerations] = useState<MusicGeneration[]>([]);
+  const [regenerating, setRegenerating] = useState(false);
+  const [pollKey, setPollKey] = useState(0);
+  const [selectedNoteIndex, setSelectedNoteIndex] = useState<number | null>(null);
+  const [selectedNoteIndices, setSelectedNoteIndices] = useState<number[]>([]);
+  const [hoveredRollPosition, setHoveredRollPosition] = useState<{ time: number; pitch: number } | null>(null);
+  const [notesDirty, setNotesDirty] = useState(false);
+  const undoStackRef = useRef<NoteEvent[][]>([]);
 
   const backendOk = Boolean(process.env.NEXT_PUBLIC_BACKEND_URL);
 
@@ -58,6 +73,15 @@ function MelodyEditorContent() {
     []
   );
 
+  const refreshGenerations = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      setGenerations(await getTextSingGenerations(sessionId));
+    } catch {
+      /* history can lag behind the first generation */
+    }
+  }, [sessionId]);
+
   useEffect(() => {
     if (!sessionId) {
       router.replace("/text-to-sing");
@@ -69,9 +93,13 @@ function MelodyEditorContent() {
         const data = await getSession(sessionId);
         setStatus(data.status);
         setSourceAudioReady(data.source_audio_ready === true);
-        if (data.notes?.length) setNotes(refreshNotes(data.notes));
+        if (data.notes?.length) {
+          setNotes(refreshNotes(data.notes));
+          setNotesDirty(false);
+        }
         setKeyStr(data.key);
         setTempo(data.tempo);
+        void refreshGenerations();
       } catch {
         /* ignore */
       }
@@ -84,9 +112,11 @@ function MelodyEditorContent() {
         setSourceAudioReady(data.source_audio_ready === true);
         if (data.notes?.length) {
           setNotes(refreshNotes(data.notes));
+          setNotesDirty(false);
         }
         setKeyStr(data.key);
         setTempo(data.tempo);
+        void refreshGenerations();
         if (data.status !== "transcribing") clearInterval(t);
       } catch {
         /* keep polling */
@@ -94,16 +124,235 @@ function MelodyEditorContent() {
     }, 1200);
 
     return () => clearInterval(t);
-  }, [sessionId, router, refreshNotes]);
+  }, [sessionId, router, refreshNotes, refreshGenerations, pollKey]);
+
+  useEffect(() => {
+    if (selectedNoteIndex != null && selectedNoteIndex >= notes.length) {
+      setSelectedNoteIndex(null);
+    }
+    setSelectedNoteIndices((prev) => prev.filter((index) => index < notes.length));
+  }, [notes.length, selectedNoteIndex]);
+
+  const selectSingleNote = (index: number) => {
+    setSelectedNoteIndex(index);
+    setSelectedNoteIndices([index]);
+  };
+
+  const selectMultipleNotes = (indices: number[]) => {
+    const unique = Array.from(new Set(indices)).sort((a, b) => a - b);
+    setSelectedNoteIndices(unique);
+    setSelectedNoteIndex(unique[0] ?? null);
+  };
+
+  const updateNoteAt = useCallback((index: number, patch: Partial<NoteEvent>) => {
+    setNotes((prev) => {
+      undoStackRef.current.push(prev.map((note) => ({ ...note })));
+      return prev.map((note, i) => {
+        if (i !== index) return note;
+        const pitch = Math.max(0, Math.min(127, Math.round(patch.pitch ?? note.pitch)));
+        const duration = Math.max(0.03, Number((patch.duration ?? note.duration).toFixed(4)));
+        const startTime = Math.max(0, Number((patch.start_time ?? note.start_time).toFixed(4)));
+        return {
+          ...note,
+          ...patch,
+          pitch,
+          note_name: midiToName(pitch),
+          start_time: startTime,
+          duration,
+        };
+      });
+    });
+    setNotesDirty(true);
+    setSaveError(null);
+  }, []);
+
+  const updateNoteAtLatest = useCallback((
+    index: number,
+    getPatch: (note: NoteEvent) => Partial<NoteEvent>
+  ) => {
+    setNotes((prev) => {
+      undoStackRef.current.push(prev.map((note) => ({ ...note })));
+      return prev.map((note, i) => {
+        if (i !== index) return note;
+        const patch = getPatch(note);
+        const pitch = Math.max(0, Math.min(127, Math.round(patch.pitch ?? note.pitch)));
+        const duration = Math.max(0.03, Number((patch.duration ?? note.duration).toFixed(4)));
+        const startTime = Math.max(0, Number((patch.start_time ?? note.start_time).toFixed(4)));
+        return {
+          ...note,
+          ...patch,
+          pitch,
+          note_name: midiToName(pitch),
+          start_time: startTime,
+          duration,
+        };
+      });
+    });
+    setNotesDirty(true);
+    setSaveError(null);
+  }, []);
 
   const updatePitch = (index: number, pitch: number) => {
     const p = Math.max(36, Math.min(96, Math.round(pitch)));
+    updateNoteAt(index, { pitch: p });
+  };
+
+  const deleteSelectedNote = useCallback(() => {
+    const selected = new Set(
+      selectedNoteIndices.length
+        ? selectedNoteIndices
+        : selectedNoteIndex == null
+          ? []
+          : [selectedNoteIndex]
+    );
+    if (!selected.size) return;
     setNotes((prev) => {
-      const next = [...prev];
-      if (!next[index]) return prev;
-      next[index] = { ...next[index], pitch: p, note_name: midiToName(p) };
+      undoStackRef.current.push(prev.map((note) => ({ ...note })));
+      return prev.filter((_, i) => !selected.has(i));
+    });
+    setSelectedNoteIndex(null);
+    setSelectedNoteIndices([]);
+    setNotesDirty(true);
+    setSaveError(null);
+  }, [selectedNoteIndex, selectedNoteIndices]);
+
+  const addNoteAtHover = useCallback(() => {
+    if (!hoveredRollPosition) return;
+    const start = Math.max(0, Number((Math.round(hoveredRollPosition.time / 0.05) * 0.05).toFixed(4)));
+    const pitch = Math.max(0, Math.min(127, hoveredRollPosition.pitch));
+    setNotes((prev) => {
+      undoStackRef.current.push(prev.map((note) => ({ ...note })));
+      const newNote: NoteEvent = {
+        note_name: midiToName(pitch),
+        pitch,
+        start_time: start,
+        duration: 0.5,
+      };
+      const next = [...prev, newNote].sort((a, b) => a.start_time - b.start_time);
+      const insertedIndex = next.findIndex((note) => note === newNote);
+      setSelectedNoteIndex(insertedIndex);
+      setSelectedNoteIndices([insertedIndex]);
       return next;
     });
+    setNotesDirty(true);
+    setSaveError(null);
+  }, [hoveredRollPosition]);
+
+  const splitNoteAt = useCallback((index: number, splitTime: number) => {
+    setNotes((prev) => {
+      const target = prev[index];
+      if (!target) return prev;
+      const noteStart = target.start_time;
+      const noteEnd = target.start_time + target.duration;
+      const clampedSplit = Math.max(noteStart + 0.03, Math.min(noteEnd - 0.03, splitTime));
+      if (clampedSplit <= noteStart || clampedSplit >= noteEnd) return prev;
+
+      undoStackRef.current.push(prev.map((note) => ({ ...note })));
+      const first: NoteEvent = {
+        ...target,
+        duration: Number((clampedSplit - noteStart).toFixed(4)),
+      };
+      const second: NoteEvent = {
+        ...target,
+        start_time: Number(clampedSplit.toFixed(4)),
+        duration: Number((noteEnd - clampedSplit).toFixed(4)),
+      };
+      setSelectedNoteIndex(index + 1);
+      setSelectedNoteIndices([index + 1]);
+      return [
+        ...prev.slice(0, index),
+        first,
+        second,
+        ...prev.slice(index + 1),
+      ];
+    });
+    setNotesDirty(true);
+    setSaveError(null);
+  }, []);
+
+  const undoLastEdit = useCallback(() => {
+    const previous = undoStackRef.current.pop();
+    if (!previous) return;
+    setNotes(previous);
+    setSelectedNoteIndex(null);
+    setSelectedNoteIndices([]);
+    setNotesDirty(true);
+    setSaveError(null);
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+
+      if (event.code === "Space") {
+        event.preventDefault();
+        setToggleRequest((value) => value + 1);
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        undoLastEdit();
+        return;
+      }
+      if (event.key.toLowerCase() === "t") {
+        event.preventDefault();
+        addNoteAtHover();
+        return;
+      }
+
+      const activeSelection = selectedNoteIndices.length
+        ? selectedNoteIndices
+        : selectedNoteIndex == null
+          ? []
+          : [selectedNoteIndex];
+      if (!activeSelection.length) return;
+
+      if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+        event.preventDefault();
+        for (const index of activeSelection) {
+          updateNoteAtLatest(index, (selected) => ({
+            pitch: selected.pitch + (event.key === "ArrowUp" ? 1 : -1),
+          }));
+        }
+        return;
+      }
+
+      if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        const step = 0.05;
+        for (const index of activeSelection) {
+          if (event.key === "ArrowLeft") {
+            updateNoteAtLatest(index, (selected) => {
+              const extendBy = Math.min(step, selected.start_time);
+              return {
+                start_time: selected.start_time - extendBy,
+                duration: selected.duration + extendBy,
+              };
+            });
+          } else {
+            updateNoteAtLatest(index, (selected) => ({
+              duration: selected.duration + step,
+            }));
+          }
+        }
+        return;
+      }
+
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteSelectedNote();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [addNoteAtHover, deleteSelectedNote, selectedNoteIndex, selectedNoteIndices, undoLastEdit, updateNoteAtLatest]);
+
+  const seekAndPlayFrom = (time: number) => {
+    setPianoTime(time);
+    setPlaybackStartAt(time);
+    setPlayRequest((value) => value + 1);
   };
 
   const downloadMidi = () => {
@@ -119,6 +368,7 @@ function MelodyEditorContent() {
     setSaving(true);
     try {
       await updateSessionMelody(sessionId, notes);
+      setNotesDirty(false);
     } catch (e) {
       setSaveError(e instanceof Error ? e.message : "Save failed");
     } finally {
@@ -126,21 +376,51 @@ function MelodyEditorContent() {
     }
   };
 
-  const goHarmony = async () => {
-    setHarmBusy(true);
+  const arrangeFromMelody = async () => {
+    if (!notes.length) {
+      setSaveError("Generate or edit a melody first.");
+      return;
+    }
     setSaveError(null);
+    setArranging(true);
     try {
-      await updateSessionMelody(sessionId, notes);
-      await harmonizeSession(sessionId);
+      await harmonizeSessionWithNotes(sessionId, notes);
+      setNotesDirty(false);
       router.push(`/processing?id=${sessionId}`);
     } catch (e) {
-      setHarmBusy(false);
-      setSaveError(e instanceof Error ? e.message : "Harmonize failed");
+      setSaveError(e instanceof Error ? e.message : "Arrangement failed");
+      setArranging(false);
+    }
+  };
+
+  const regenerateSong = async () => {
+    const prompt = editPrompt.trim();
+    if (!prompt) {
+      setSaveError("Describe what you want changed first.");
+      return;
+    }
+    setRegenerating(true);
+    setSaveError(null);
+    try {
+      await regenerateTextSing(sessionId, prompt);
+      setEditPrompt("");
+      setNotes([]);
+      setSelectedNoteIndex(null);
+      setSelectedNoteIndices([]);
+      setNotesDirty(false);
+      setSourceAudioReady(false);
+      setStatus("transcribing");
+      setPollKey((n) => n + 1);
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : "Regenerate failed");
+    } finally {
+      setRegenerating(false);
     }
   };
 
   const working = status === "transcribing";
   const failed = status === "failed";
+  const selectedNote = selectedNoteIndex == null ? null : notes[selectedNoteIndex] ?? null;
 
   return (
     <main className="min-h-screen bg-gradient-to-b from-white to-violet-50 p-6 md:p-10 max-w-3xl mx-auto space-y-8">
@@ -211,6 +491,78 @@ function MelodyEditorContent() {
         </section>
       )}
 
+      {backendOk && (
+        <section className="rounded-2xl border border-fuchsia-200 bg-white p-4 shadow-sm space-y-3">
+          <div>
+            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+              Edit / regenerate song
+            </h2>
+            <p className="text-xs text-gray-500 mt-1">
+              Ask for changes to the next generation: <span className="font-mono">(make the background music sadder, remove drums, acoustic guitar, slower)</span>.
+              Previous generations stay below.
+            </p>
+          </div>
+          <textarea
+            value={editPrompt}
+            onChange={(e) => setEditPrompt(e.target.value)}
+            disabled={regenerating || working}
+            rows={3}
+            placeholder="e.g. (make it sadder, less drums, more piano, darker background music)"
+            className="w-full rounded-2xl border border-fuchsia-200 bg-white px-3 py-2 text-sm text-gray-800 outline-none focus:ring-2 focus:ring-fuchsia-100 disabled:opacity-60"
+          />
+          <button
+            type="button"
+            onClick={regenerateSong}
+            disabled={regenerating || working || !editPrompt.trim()}
+            className="px-4 py-2 rounded-xl bg-fuchsia-600 text-white text-sm font-semibold shadow hover:bg-fuchsia-700 disabled:opacity-50"
+          >
+            {regenerating || working ? "Generating new version…" : "Generate edited version"}
+          </button>
+        </section>
+      )}
+
+      {generations.length > 0 && (
+        <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm space-y-3">
+          <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">
+            Past generations
+          </h2>
+          <div className="space-y-3">
+            {generations.map((g, i) => (
+              <div
+                key={g.id}
+                className="rounded-xl border border-gray-100 bg-gray-50 p-3 space-y-2"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs font-semibold text-gray-700">
+                    Version {generations.length - i}
+                    {g.is_current ? " · current" : ""}
+                  </p>
+                  <span className="text-[11px] text-gray-400">
+                    {new Date(g.created_at).toLocaleString()}
+                  </span>
+                </div>
+                {g.edit_prompt && (
+                  <p className="text-xs text-fuchsia-700">
+                    Edit: {g.edit_prompt}
+                  </p>
+                )}
+                {g.style_prompt && (
+                  <p className="text-xs text-gray-500">
+                    Direction: {g.style_prompt}
+                  </p>
+                )}
+                {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
+                <audio
+                  controls
+                  src={textSingGenerationAudioUrl(g.id)}
+                  className="w-full h-8"
+                />
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {working && !sourceAudioReady && (
         <p className="text-xs text-gray-500">Waiting for the first voice file from the server…</p>
       )}
@@ -231,7 +583,56 @@ function MelodyEditorContent() {
             </span>
           </div>
 
-          <PianoRoll notes={notes} currentTime={pianoTime} />
+          <PianoRoll
+            notes={notes}
+            currentTime={pianoTime}
+            selectedIndex={selectedNoteIndex}
+            selectedIndices={selectedNoteIndices}
+            onSelectNote={selectSingleNote}
+            onSelectNotes={selectMultipleNotes}
+            onChangeNote={updateNoteAt}
+            onSplitNote={splitNoteAt}
+            onSeek={seekAndPlayFrom}
+            onHoverPosition={setHoveredRollPosition}
+          />
+
+          <div className="rounded-2xl border border-gray-100 bg-gray-50 p-4 space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-700">Edit notes directly</h3>
+                <p className="text-xs text-gray-400">
+                  Drag the middle of a note to move it in time or pitch. Drag the left or right edge to trim or extend.
+                  Drag across notes to select multiple. Arrow keys and Delete apply to the selection.
+                  Hover the grid and press T to add a note. Ctrl/Cmd+Z undoes the last edit.
+                  Double-click a note to split it.
+                </p>
+              </div>
+              <span className="text-xs font-semibold text-gray-400">
+                {saving ? "Saving..." : notesDirty ? "Unsaved" : "Saved"}
+              </span>
+            </div>
+
+            {selectedNote ? (
+              <div className="flex flex-wrap gap-2 text-xs text-gray-500">
+                {selectedNoteIndices.length > 1 && (
+                  <span className="px-2.5 py-1 rounded-full bg-violet-100 text-violet-700 font-semibold">
+                    {selectedNoteIndices.length} selected
+                  </span>
+                )}
+                <span className="px-2.5 py-1 rounded-full bg-white border border-gray-100 font-mono">
+                  {selectedNote.note_name}
+                </span>
+                <span className="px-2.5 py-1 rounded-full bg-white border border-gray-100">
+                  start {selectedNote.start_time.toFixed(2)}s
+                </span>
+                <span className="px-2.5 py-1 rounded-full bg-white border border-gray-100">
+                  duration {selectedNote.duration.toFixed(2)}s
+                </span>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">No note selected.</p>
+            )}
+          </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <NotePlayer
@@ -239,6 +640,9 @@ function MelodyEditorContent() {
               tempo={tempo}
               musicalKey={keyStr}
               onTimeUpdate={setPianoTime}
+              seekTime={playbackStartAt}
+              playRequest={playRequest}
+              toggleRequest={toggleRequest}
             />
             <button
               type="button"
@@ -250,18 +654,10 @@ function MelodyEditorContent() {
             <button
               type="button"
               onClick={saveMelody}
-              disabled={saving}
+              disabled={saving || !notesDirty}
               className="px-4 py-2 rounded-xl bg-violet-600 text-white text-sm font-semibold shadow hover:bg-violet-700 disabled:opacity-50"
             >
-              {saving ? "Saving…" : "Save melody"}
-            </button>
-            <button
-              type="button"
-              onClick={goHarmony}
-              disabled={harmBusy}
-              className="px-4 py-2 rounded-xl border border-violet-300 bg-violet-50 text-violet-800 text-sm font-semibold hover:bg-violet-100 disabled:opacity-50"
-            >
-              {harmBusy ? "…" : "🎼 Choral harmony"}
+              {saving ? "Saving…" : notesDirty ? "Save melody" : "Saved"}
             </button>
           </div>
 
@@ -295,9 +691,31 @@ function MelodyEditorContent() {
           </div>
 
           <p className="text-xs text-gray-500">
-            Tip: after editing, click <strong>Save melody</strong> before sending to choral
-            harmony or opening the main notes page, so the server has your changes.
+            Tip: after editing, click <strong>Save melody</strong> before opening the main
+            notes page, so the server has your changes.
           </p>
+
+          <section className="rounded-3xl bg-gradient-to-br from-violet-600 to-violet-700 p-6 text-white text-center space-y-3">
+            <h2 className="text-xl font-bold">Ready for chords and arrangement?</h2>
+            <p className="text-sm text-violet-200 max-w-md mx-auto">
+              This saves your edited piano roll, generates the chord progression and full
+              arrangement, then takes you to the normal arrangement/MIDI result flow.
+            </p>
+            <button
+              type="button"
+              onClick={arrangeFromMelody}
+              disabled={arranging || working || notes.length === 0}
+              className="inline-flex items-center gap-2 px-6 py-3 rounded-2xl bg-white text-violet-700 text-sm font-bold shadow hover:shadow-md hover:-translate-y-0.5 transition disabled:opacity-60 disabled:cursor-not-allowed"
+            >
+              {arranging ? (
+                <>
+                  <span className="animate-spin">⟳</span> Arranging…
+                </>
+              ) : (
+                "🎼 Arrange chords + MIDI"
+              )}
+            </button>
+          </section>
         </>
       )}
 

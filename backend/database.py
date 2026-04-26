@@ -43,6 +43,18 @@ def init_db() -> None:
             bass        TEXT,
             musicxml    TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS music_generations (
+            id                    TEXT PRIMARY KEY,
+            session_id            TEXT REFERENCES sessions(id),
+            lyrics                TEXT,
+            style_prompt          TEXT,
+            edit_prompt           TEXT,
+            prompt                TEXT,
+            audio_path            TEXT,
+            parent_generation_id  TEXT,
+            created_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
     # Add bpm_librosa to databases created before this column existed
     try:
