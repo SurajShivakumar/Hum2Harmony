@@ -17,7 +17,6 @@ import tempfile
 
 import librosa
 import numpy as np
-from basic_pitch.inference import predict
 
 try:
     from core.neuralnote_runner import transcribe_audio_neuralnote
@@ -26,12 +25,16 @@ except Exception:  # pragma: no cover - keeps Basic Pitch usable during setup
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
-# Force ONNX: TF 2.20 is present on this machine but incompatible with the
-# basic-pitch SavedModel format ('_UserObject' has no attribute 'add_slot').
-_ONNX_MODEL_PATH = (
-    pathlib.Path(__import__("basic_pitch").__file__).parent
-    / "saved_models" / "icassp_2022" / "nmp.onnx"
-)
+
+def _get_basic_pitch_onnx_model_path() -> pathlib.Path:
+    """Resolve Basic Pitch ONNX model lazily so the backend can boot without it."""
+    try:
+        module_path = pathlib.Path(__import__("basic_pitch").__file__).parent
+    except Exception as exc:
+        raise RuntimeError(
+            "basic_pitch is not installed. Install Basic Pitch or use NeuralNote."
+        ) from exc
+    return module_path / "saved_models" / "icassp_2022" / "nmp.onnx"
 
 MAJOR_SCALE = [0, 2, 4, 5, 7, 9, 11]
 MINOR_SCALE = [0, 2, 3, 5, 7, 8, 10]
@@ -280,10 +283,18 @@ def _transcribe_audio_basic_pitch(audio_path: str) -> tuple[list[dict], int | No
     bpm_librosa: int | None = None
 
     try:
+        try:
+            from basic_pitch.inference import predict
+        except Exception as exc:
+            raise RuntimeError(
+                "basic_pitch is not installed. Install Basic Pitch dependencies to use fallback transcription."
+            ) from exc
+
         bpm_librosa = estimate_bpm_librosa(wav_path)
+        model_path = _get_basic_pitch_onnx_model_path()
         _model_output, _midi_data, note_events = predict(
             wav_path,
-            model_or_model_path=_ONNX_MODEL_PATH,
+            model_or_model_path=model_path,
             onset_threshold=0.4,        # catch all real note onsets
             frame_threshold=0.25,       # sustain sensitivity
             minimum_note_length=80,     # ms
@@ -318,6 +329,73 @@ def _transcribe_audio_basic_pitch(audio_path: str) -> tuple[list[dict], int | No
     return notes, bpm_librosa
 
 
+def _transcribe_audio_pyin(audio_path: str) -> tuple[list[dict], int | None]:
+    """
+    Emergency monophonic fallback when neither NeuralNote nor Basic Pitch is
+    available. Uses librosa.pyin to recover a lead melody line.
+    """
+    wav_path, converted = _to_wav(audio_path)
+    try:
+        y, sr = librosa.load(wav_path, sr=22050, mono=True)
+        bpm_librosa = estimate_bpm_librosa(wav_path)
+    finally:
+        if converted and os.path.exists(wav_path):
+            os.remove(wav_path)
+
+    if y.size < sr // 8:
+        return [], bpm_librosa
+
+    f0, voiced_flag, _ = librosa.pyin(
+        y,
+        fmin=float(librosa.note_to_hz("C2")),
+        fmax=float(librosa.note_to_hz("C6")),
+        sr=sr,
+        frame_length=2048,
+        hop_length=256,
+    )
+
+    if f0 is None or voiced_flag is None:
+        return [], bpm_librosa
+
+    times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=256)
+    notes: list[dict] = []
+    i = 0
+    while i < len(f0):
+        if not voiced_flag[i] or not np.isfinite(f0[i]) or f0[i] <= 0:
+            i += 1
+            continue
+
+        start_i = i
+        hz_values = []
+        while i < len(f0) and voiced_flag[i] and np.isfinite(f0[i]) and f0[i] > 0:
+            hz_values.append(float(f0[i]))
+            i += 1
+
+        if not hz_values:
+            continue
+
+        start_t = float(times[start_i])
+        end_t = float(times[min(i, len(times) - 1)])
+        duration = end_t - start_t
+        if duration < 0.07:
+            continue
+
+        midi = int(round(librosa.hz_to_midi(float(np.median(hz_values)))))
+        midi = max(36, min(96, midi))
+        notes.append({
+            "pitch": midi,
+            "note_name": midi_to_name(midi),
+            "start_time": round(start_t, 4),
+            "end_time": round(end_t, 4),
+            "duration": round(duration, 4),
+            "amplitude": 0.75,
+        })
+
+    notes = merge_nearby(monophonize(sorted(notes, key=lambda n: n["start_time"])))
+    notes = filter_lead_notes(notes)
+    return notes, bpm_librosa
+
+
 def transcribe_audio(audio_path: str) -> tuple[list[dict], int | None]:
     """
     Prefer NeuralNote's C++ transcription engine when its CLI is available.
@@ -348,6 +426,13 @@ def transcribe_audio(audio_path: str) -> tuple[list[dict], int | None]:
             if engine == "neuralnote_strict":
                 raise
 
-    notes, fallback_bpm = _transcribe_audio_basic_pitch(audio_path)
-    print(f"[transcription] engine=basic-pitch notes={len(notes)}")
-    return notes, bpm_librosa if bpm_librosa is not None else fallback_bpm
+    try:
+        notes, fallback_bpm = _transcribe_audio_basic_pitch(audio_path)
+        print(f"[transcription] engine=basic-pitch notes={len(notes)}")
+        return notes, bpm_librosa if bpm_librosa is not None else fallback_bpm
+    except Exception as exc:
+        print(f"[basic-pitch] unavailable, falling back to librosa pyin: {exc}")
+
+    notes, pyin_bpm = _transcribe_audio_pyin(audio_path)
+    print(f"[transcription] engine=pyin-fallback notes={len(notes)}")
+    return notes, bpm_librosa if bpm_librosa is not None else pyin_bpm

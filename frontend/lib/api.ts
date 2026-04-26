@@ -27,6 +27,8 @@ export interface SessionData {
   tempo: number;
   /** Global BPM from librosa on the raw audio (can differ from `tempo`). */
   bpm_librosa: number | null;
+  /** True when the session’s source file exists (e.g. TTS MP3 or upload). */
+  source_audio_ready?: boolean;
   notes: NoteEvent[];
   chords: ChordEvent[];
   parts: {
@@ -61,6 +63,39 @@ export async function getSession(sessionId: string): Promise<SessionData> {
 export async function harmonizeSession(sessionId: string): Promise<void> {
   const res = await fetch(`${BASE}/harmonize/${sessionId}`, { method: "POST" });
   if (!res.ok) throw new Error(`Harmonize failed: ${res.status}`);
+}
+
+// ── Text → ElevenLabs → transcribe (separate from hum upload) ────────────────
+
+export async function textSing(lyrics: string): Promise<{ session_id: string; status: string }> {
+  const res = await fetch(`${BASE}/text-sing`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ lyrics }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Text sing failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** AI-generated or uploaded source track for a session. */
+export function sourceAudioUrl(sessionId: string): string {
+  return `${BASE}/session/${sessionId}/source-audio`;
+}
+
+/** Persist edited lead melody (pitch / timing) to the server. */
+export async function updateSessionMelody(sessionId: string, notes: NoteEvent[]): Promise<void> {
+  const res = await fetch(`${BASE}/session/${sessionId}/melody`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ notes }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail ?? `Save melody failed: ${res.status}`);
+  }
 }
 
 // ── Melody voice (ElevenLabs single-voice preview) ───────────────────────────

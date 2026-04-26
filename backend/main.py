@@ -15,15 +15,18 @@ Run:
 import json
 import os
 import uuid
+from typing import Iterator
 
 from dotenv import load_dotenv
 load_dotenv()  # loads .env in the backend directory
 
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel, Field
 
 from core.basic_pitch_runner import (
+    midi_to_name,
     transcribe_audio,
     estimate_tempo_from_notes,
     quantize_to_scale,
@@ -57,9 +60,70 @@ init_db()
 CHOIR_PARTS = ("soprano", "alto", "tenor", "bass", "mixed")
 
 
+class TextSingRequest(BaseModel):
+    lyrics: str = Field(..., min_length=1, max_length=4000)
+
+
+class MelodyNoteIn(BaseModel):
+    pitch: int
+    start_time: float
+    duration: float
+    note_name: str | None = None
+
+
+class MelodyUpdateRequest(BaseModel):
+    notes: list[MelodyNoteIn]
+
+
 # ---------------------------------------------------------------------------
 # Background tasks
 # ---------------------------------------------------------------------------
+
+def _music_duration_ms(lyrics: str) -> int:
+    """Pick a short-but-complete music duration from lyric length."""
+    words = len(lyrics.split())
+    # Roughly 2.5 words/sec for a sung line, with room for intro/outro.
+    seconds = max(15, min(60, int(words / 2.5) + 10))
+    return seconds * 1000
+
+
+def _elevenlabs_music_compose(
+    prompt: str,
+    api_key: str,
+    music_length_ms: int,
+) -> Iterator[bytes]:
+    """Stream ElevenLabs Music generation via the REST API."""
+    import requests
+
+    resp = requests.post(
+        "https://api.elevenlabs.io/v1/music",
+        headers={
+            "xi-api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        },
+        json={
+            "prompt": prompt,
+            "music_length_ms": music_length_ms,
+            "model_id": "music_v1",
+            "force_instrumental": False,
+        },
+        stream=True,
+        timeout=180,
+    )
+    if not resp.ok:
+        detail = resp.text
+        try:
+            detail_json = resp.json()
+            suggestion = (
+                detail_json.get("prompt_suggestion")
+                or detail_json.get("composition_plan_suggestion")
+            )
+            detail = suggestion or detail_json.get("detail") or detail
+        except Exception:
+            pass
+        raise RuntimeError(f"ElevenLabs Music failed ({resp.status_code}): {detail}")
+    yield from resp.iter_content(chunk_size=64 * 1024)
 
 def run_transcription(session_id: str, audio_path: str) -> None:
     """Phase 1: NeuralNote/Basic Pitch transcription only."""
@@ -88,6 +152,49 @@ def run_transcription(session_id: str, audio_path: str) -> None:
         db.execute("UPDATE sessions SET status='failed' WHERE id=?", (session_id,))
         db.commit()
     finally:
+        db.close()
+
+
+def run_text_sing(session_id: str, lyrics: str) -> None:
+    """
+    Generate actual music/vocals using ElevenLabs Music, then transcribe the
+    resulting audio into editable notes for MIDI export / harmony.
+    """
+    api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+    text = lyrics.strip()[:3000]
+    path = os.path.join(AUDIO_DIR, f"{session_id}_music.mp3")
+
+    try:
+        if not api_key:
+            raise RuntimeError("ELEVENLABS_API_KEY is not set.")
+        if not text:
+            raise ValueError("Empty lyrics")
+
+        duration_ms = _music_duration_ms(text)
+        prompt = (
+            "Create an original short song with a clear, normal human lead vocal singing "
+            "the provided lyrics. Use a regular mid-range voice, not chipmunk, not spoken "
+            "word, not narration. Keep the arrangement sparse so the vocal melody is easy "
+            "to detect for MIDI transcription. Do not add extra words beyond the lyrics. "
+            f"Style: simple pop ballad, warm, melodic, steady tempo. Lyrics:\n{text}"
+        )
+
+        with open(path, "wb") as f:
+            for chunk in _elevenlabs_music_compose(prompt, api_key, duration_ms):
+                if chunk:
+                    f.write(chunk)
+
+        db = get_db()
+        db.execute("UPDATE sessions SET audio_path=? WHERE id=?", (path, session_id))
+        db.commit()
+        db.close()
+
+        run_transcription(session_id, path)
+    except Exception as exc:
+        print(f"[text-sing] session={session_id} error: {exc}")
+        db = get_db()
+        db.execute("UPDATE sessions SET status='failed' WHERE id=?", (session_id,))
+        db.commit()
         db.close()
 
 
@@ -189,6 +296,96 @@ async def upload(background_tasks: BackgroundTasks, audio: UploadFile = File(...
     return {"session_id": session_id, "status": "transcribing"}
 
 
+@app.post("/text-sing")
+async def text_sing(req: TextSingRequest, background_tasks: BackgroundTasks):
+    """
+    Generate spoken/sung audio from lyrics via ElevenLabs, then transcribe to MIDI notes
+    (same pipeline as humming upload).
+    """
+    if not os.getenv("ELEVENLABS_API_KEY", "").strip():
+        raise HTTPException(
+            status_code=503,
+            detail="ELEVENLABS_API_KEY is not set. Add it to backend/.env",
+        )
+
+    session_id = str(uuid.uuid4())
+    db = get_db()
+    db.execute(
+        "INSERT INTO sessions (id, status, audio_path) VALUES (?, 'transcribing', ?)",
+        (session_id, "text-sing-pending"),
+    )
+    db.commit()
+    db.close()
+
+    background_tasks.add_task(run_text_sing, session_id, req.lyrics)
+    return {"session_id": session_id, "status": "transcribing"}
+
+
+@app.get("/session/{session_id}/source-audio")
+async def get_session_source_audio(session_id: str):
+    """Stream the original session audio (upload or text-sing TTS)."""
+    db = get_db()
+    row = db.execute("SELECT audio_path FROM sessions WHERE id=?", (session_id,)).fetchone()
+    db.close()
+    if not row or not row["audio_path"] or row["audio_path"] == "text-sing-pending":
+        raise HTTPException(status_code=404, detail="No source audio yet")
+    path = row["audio_path"]
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="Source audio file missing")
+
+    ext = os.path.splitext(path)[1].lower()
+    media = {
+        ".mp3": "audio/mpeg",
+        ".wav": "audio/wav",
+        ".webm": "audio/webm",
+        ".ogg": "audio/ogg",
+        ".m4a": "audio/mp4",
+    }.get(ext, "application/octet-stream")
+
+    return FileResponse(
+        path,
+        media_type=media,
+        filename=os.path.basename(path),
+    )
+
+
+@app.put("/session/{session_id}/melody")
+async def put_session_melody(session_id: str, body: MelodyUpdateRequest):
+    """Replace the stored lead melody (e.g. after editing pitches in the UI)."""
+    db = get_db()
+    row = db.execute("SELECT id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        db.close()
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    notes: list[dict] = []
+    for n in body.notes:
+        p = int(n.pitch)
+        notes.append(
+            {
+                "pitch": p,
+                "start_time": round(float(n.start_time), 4),
+                "duration": round(float(n.duration), 4),
+                "note_name": n.note_name if n.note_name else midi_to_name(p),
+            }
+        )
+
+    m = db.execute("SELECT id FROM melodies WHERE session_id=?", (session_id,)).fetchone()
+    if m:
+        db.execute(
+            "UPDATE melodies SET notes=? WHERE session_id=?",
+            (json.dumps(notes), session_id),
+        )
+    else:
+        db.execute(
+            "INSERT INTO melodies VALUES (?, ?, ?)",
+            (str(uuid.uuid4()), session_id, json.dumps(notes)),
+        )
+    db.commit()
+    db.close()
+    return {"ok": True, "count": len(notes)}
+
+
 @app.post("/harmonize/{session_id}")
 async def harmonize(session_id: str, background_tasks: BackgroundTasks):
     """Trigger chord detection + SATB arrangement for a session with notes_ready status."""
@@ -237,6 +434,12 @@ async def get_session(session_id: str):
     )
 
     bpm = session.get("bpm_librosa")
+    ap = session.get("audio_path")
+    source_audio_ready = bool(
+        ap
+        and str(ap) != "text-sing-pending"
+        and os.path.isfile(str(ap))
+    )
     return {
         "session_id": session_id,
         "status": session["status"],
@@ -246,6 +449,7 @@ async def get_session(session_id: str):
         "notes": notes,
         "chords": chords,
         "parts": parts,
+        "source_audio_ready": source_audio_ready,
     }
 
 

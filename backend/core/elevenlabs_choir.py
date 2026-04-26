@@ -26,6 +26,7 @@ import copy
 import io
 import logging
 import os
+import re
 from typing import Any
 
 import numpy as np
@@ -55,6 +56,14 @@ MALE_VOICE_IDS = [
     "pNInz6obpgDQGcFmaJgB",  # Adam
 ]
 
+_NOTE_LETTERS = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _note_label(midi: int) -> str:
+    m = int(max(0, min(127, midi)))
+    return f"{_NOTE_LETTERS[m % 12]}{(m // 12) - 1}"
+
+
 # How tightly to follow the written duration before hard-truncating.
 MAX_STRETCH_RATIO = 2.5
 MIN_STRETCH_RATIO = 0.4
@@ -64,9 +73,19 @@ SYLLABLE = "ahhh"
 # ElevenLabs TTS
 # ---------------------------------------------------------------------------
 
-def _elevenlabs_tts(text: str, voice_id: str, api_key: str) -> bytes:
+def _elevenlabs_tts(
+    text: str,
+    voice_id: str,
+    api_key: str,
+    *,
+    singing: bool = False,
+) -> bytes:
     """Return raw MP3 bytes from ElevenLabs for the given text + voice."""
     import requests  # soft import — only paid when needed
+
+    # Never prepend “instructions” to the string — the model will read them aloud.
+    # For a slightly more musical delivery, only adjust voice_settings when singing=True.
+    out_text = text.strip()
 
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}"
     headers = {
@@ -74,17 +93,30 @@ def _elevenlabs_tts(text: str, voice_id: str, api_key: str) -> bytes:
         "Content-Type": "application/json",
         "Accept": "audio/mpeg",
     }
-    payload = {
-        "text": text,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.82,          # clearer, steadier timbre
+    # Slightly more expressive / less flat when we want a sung line.
+    if singing:
+        voice_settings = {
+            "stability": 0.50,
+            "similarity_boost": 0.78,
+            "style": 0.50,
+            "use_speaker_boost": True,
+        }
+        model_id = "eleven_multilingual_v2"
+    else:
+        voice_settings = {
+            "stability": 0.82,
             "similarity_boost": 0.90,
             "style": 0.0,
             "use_speaker_boost": True,
-        },
+        }
+        model_id = "eleven_multilingual_v2"
+
+    payload = {
+        "text": out_text,
+        "model_id": model_id,
+        "voice_settings": voice_settings,
     }
-    resp = requests.post(url, json=payload, headers=headers, timeout=30)
+    resp = requests.post(url, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     return resp.content
 
@@ -138,9 +170,21 @@ def _midi_to_hz(midi: float) -> float:
 
 
 def _pitch_shift(audio: np.ndarray, sr: int, source_hz: float, target_midi: float) -> np.ndarray:
+    return _pitch_shift_toward_midi(audio, sr, source_hz, target_midi, max_semitones=96.0)
+
+
+def _pitch_shift_toward_midi(
+    audio: np.ndarray,
+    sr: int,
+    source_hz: float,
+    target_midi: float,
+    max_semitones: float,
+) -> np.ndarray:
+    """Nudge pitch toward `target_midi` but cap by `max_semitones` (keeps TTS natural when small)."""
     import librosa
     target_hz = _midi_to_hz(target_midi)
     n_steps = 12.0 * np.log2(target_hz / max(source_hz, 1.0))
+    n_steps = max(-max_semitones, min(max_semitones, n_steps))
     if abs(n_steps) < 0.05:
         return audio
     return librosa.effects.pitch_shift(audio, sr=sr, n_steps=n_steps).astype(np.float32)
@@ -349,33 +393,123 @@ def _pick_voice_id(
     return MALE_VOICE_IDS[0] if med < 62 else FEMALE_VOICE_IDS[0]
 
 
+_VOWELS = "aeiouyAEIOUY"
+
+
+def _split_word_to_syllables(word: str) -> list[str]:
+    if not word or len(word) < 2:
+        return [word] if word else []
+    groups: list[tuple[int, int]] = []
+    i = 0
+    while i < len(word):
+        if word[i] not in _VOWELS:
+            i += 1
+            continue
+        a = i
+        while i < len(word) and word[i] in _VOWELS:
+            i += 1
+        groups.append((a, i))
+    if len(groups) <= 1:
+        return [word]
+    out: list[str] = []
+    s0 = 0
+    for g, (_a, b) in enumerate(groups[:-1]):
+        na = groups[g + 1][0]
+        cut = na - 1 if (na - b) > 1 else b
+        if cut > s0:
+            out.append(word[s0:cut])
+            s0 = cut
+    if s0 < len(word):
+        out.append(word[s0:])
+    return [x for x in out if x]
+
+
+def split_lyrics_into_syllable_tokens(lyrics: str) -> list[str]:
+    """Chips suitable for one TTS call per singing step."""
+    words = re.findall(r"[A-Za-z0-9']+", lyrics)
+    tokens: list[str] = []
+    for w in words:
+        tokens.extend(_split_word_to_syllables(w))
+    return [t for t in tokens if t.strip()]
+
+
+def build_simple_sung_melody(
+    n_notes: int,
+    bpm: int = 96,
+) -> list[dict[str, Any]]:
+    """One mild contour per syllable; timing from BPM (singing line, not speaking)."""
+    bpm = max(60, min(180, bpm))
+    beat = 60.0 / bpm
+    step = beat * 0.48
+    gap = 0.018
+    # Mid / “regular voice” range (~E3–D4), not C4+ which reads bright after pitch-shift.
+    pattern = [52, 54, 55, 57, 55, 54, 52, 55, 57, 55, 54, 52, 55, 54]
+    out: list[dict[str, Any]] = []
+    t = 0.0
+    for i in range(n_notes):
+        pitch = pattern[i % len(pattern)]
+        dur = max(0.14, min(0.52, float(step)))
+        out.append(
+            {
+                "pitch": pitch,
+                "start_time": round(t, 4),
+                "duration": round(dur, 4),
+                "note_name": _note_label(pitch),
+                "amplitude": 0.82,
+            }
+        )
+        t += dur + gap
+    return out
+
+
 def _synth_part(
     notes: list[dict[str, Any]],
     voice_id: str | None,
     api_key: str,
     sr: int = SAMPLE_RATE,
     part_name: str | None = None,
+    syllable_texts: list[str] | None = None,
 ) -> np.ndarray:
     """
     Synthesise a single SATB part into a float32 numpy array.
     Returns an empty array if there are no notes.
+
+    If syllable_texts is set (same length as notes, melody part), fetches TTS for each
+    token and pitch-shifts to the note (true “sings the words” path).
     """
-    filtered_notes = _filter_outlier_notes(notes)
-    if part_name == "melody":
-        # Make melody voice actually follow one clear pitch line.
-        filtered_notes = _merge_nearby_same_pitch(_monophonize_lead(filtered_notes))
+    syllable_mode = (
+        part_name == "melody"
+        and syllable_texts
+        and len(notes) > 0
+        and len(syllable_texts) == len(notes)
+    )
+
+    if syllable_mode:
+        raw = sorted(notes, key=lambda n: float(n["start_time"]))
+        filtered_notes = [copy.deepcopy(n) for n in raw]
+    else:
+        filtered_notes = _filter_outlier_notes(notes)
+        if part_name == "melody":
+            filtered_notes = _merge_nearby_same_pitch(_monophonize_lead(filtered_notes))
+
     if not filtered_notes:
         return np.array([], dtype=np.float32)
     filtered_notes = sorted(filtered_notes, key=lambda n: float(n["start_time"]))
-    legato = part_name == "melody"
+    legato = part_name == "melody" and not syllable_mode
 
     chosen_voice = _pick_voice_id(filtered_notes, part_name=part_name, explicit_voice_id=voice_id)
-    log.info("Fetching ElevenLabs '%s' for voice %s …", SYLLABLE, chosen_voice)
-    mp3 = _elevenlabs_tts(SYLLABLE, chosen_voice, api_key)
-    base = _load_mp3(mp3, sr)
-    legato_base = _steady_vowel_region(base)
-    source_hz = _detect_pitch(base, sr)
-    log.info("  base pitch detected: %.1f Hz", source_hz)
+
+    base: np.ndarray | None = None
+    legato_base: np.ndarray | None = None
+    source_hz_global = 220.0
+
+    if not syllable_mode:
+        log.info("Fetching ElevenLabs '%s' for voice %s …", SYLLABLE, chosen_voice)
+        mp3 = _elevenlabs_tts(SYLLABLE, chosen_voice, api_key)
+        base = _load_mp3(mp3, sr)
+        legato_base = _steady_vowel_region(base)
+        source_hz_global = _detect_pitch(base, sr)
+        log.info("  base pitch detected: %.1f Hz", source_hz_global)
 
     # Total buffer length
     last = max(filtered_notes, key=lambda n: n["start_time"] + n["duration"])
@@ -383,7 +517,7 @@ def _synth_part(
     output = np.zeros(int(total_sec * sr), dtype=np.float32)
 
     prev_end_i = 0
-    crossfade_samples = int(0.08 * sr) if legato else int(0.02 * sr)
+    crossfade_samples = int(0.07 * sr) if legato else (int(0.045 * sr) if syllable_mode else int(0.02 * sr))
 
     for i, note in enumerate(filtered_notes):
         pitch     = float(note["pitch"])
@@ -391,32 +525,87 @@ def _synth_part(
         dur_s     = max(0.08, float(note["duration"]))
         amplitude = float(note.get("amplitude", 0.75))
 
-        # Melody legato: let each note connect into the next one.
-        if legato and i < len(filtered_notes) - 1:
-            next_start = float(filtered_notes[i + 1]["start_time"])
-            dur_s = max(dur_s, max(0.12, (next_start - start_s) + 0.10))
+        if syllable_mode:
+            token = (syllable_texts[i] or "la").strip() or "la"
+            token = token[:120]
+            log.info("Text-sing syllable TTS: %r", token[:40])
+            mp3_s = _elevenlabs_tts(token, chosen_voice, api_key, singing=False)
+            base_i = _load_mp3(mp3_s, sr)
+            source_hz = _detect_pitch(base_i, sr)
+            # Short syllables: bad F0 → huge shifts and chipmunk highs; keep in speech range.
+            source_hz = float(max(95.0, min(320.0, source_hz)))
+            source_wave = base_i
+            if syllable_mode and i < len(filtered_notes) - 1:
+                next_s = float(filtered_notes[i + 1]["start_time"])
+                slot = max(0.06, next_s - start_s)
+                dur_s = min(dur_s, max(0.1, slot * 0.97))
+        else:
+            # Melody legato: let each note connect into the next one.
+            if legato and i < len(filtered_notes) - 1:
+                next_start = float(filtered_notes[i + 1]["start_time"])
+                dur_s = max(dur_s, max(0.12, (next_start - start_s) + 0.10))
+            assert legato_base is not None and base is not None
+            source_wave = legato_base if legato else base
+            source_hz = source_hz_global
 
-        source_wave = legato_base if legato else base
-        shifted  = _pitch_shift(source_wave, sr, source_hz, pitch)
-        fitted   = _fit_duration(shifted, sr, dur_s, legato=legato)
-        if legato:
-            # Tiny attack/release + crossfade placement keeps one connected phrase.
+        if syllable_mode:
+            # Light correction toward the grid — stays close to the natural TTS timbre.
+            shifted = _pitch_shift_toward_midi(
+                source_wave, sr, source_hz, pitch, max_semitones=5.5
+            )
+        else:
+            shifted = _pitch_shift(source_wave, sr, source_hz, pitch)
+        fit_leg = legato and not syllable_mode
+        fitted   = _fit_duration(shifted, sr, dur_s, legato=fit_leg)
+        if legato and not syllable_mode:
             fitted = _apply_envelope(fitted, sr, attack_s=0.006, release_s=0.012)
+        elif syllable_mode:
+            fitted = _apply_envelope(fitted, sr, attack_s=0.004, release_s=0.02)
         fitted = fitted * amplitude
 
         start_i = int(start_s * sr)
-        if legato and i > 0:
-            # Force continuity: no silent gaps between notes.
+        if legato and not syllable_mode and i > 0:
             start_i = min(start_i, max(0, prev_end_i - crossfade_samples))
 
         prev_end_i = _crossfade_insert(output, fitted, start_i, crossfade_samples)
 
-    # Soft-clip to keep headroom for mixing
     peak = np.max(np.abs(output))
     if peak > 0.9:
         output = output * (0.9 / peak)
 
     return output
+
+
+def synthesize_sung_text_line(
+    lyrics: str,
+    api_key: str,
+    bpm: int = 96,
+) -> tuple[bytes, list[dict[str, Any]]]:
+    """
+    Build a simple diatonic-ish line and render each syllable with TTS, then
+    pitch-correct to match the score — this is the closest we get to "singing"
+    without a dedicated singing model: real words, musical rhythm and contour.
+    """
+    toks = split_lyrics_into_syllable_tokens(lyrics)
+    if not toks:
+        raise ValueError("No words to sing")
+    max_tok = 40
+    if len(toks) > max_tok:
+        toks = toks[:max_tok]
+        log.warning("Singing only first %d syllables (line too long for one pass).", max_tok)
+    mel = build_simple_sung_melody(len(toks), bpm=bpm)
+    if len(mel) != len(toks):
+        raise RuntimeError("internal: melody / syllable mismatch")
+    # Fixed mid/tenor voice so the “sung line” doesn’t default to a high bright timbre.
+    arr = _synth_part(
+        mel,
+        MALE_VOICE_IDS[0],
+        api_key,
+        SAMPLE_RATE,
+        part_name="melody",
+        syllable_texts=toks,
+    )
+    return _to_wav_bytes(arr, SAMPLE_RATE), mel
 
 
 def _to_wav_bytes(audio: np.ndarray, sr: int) -> bytes:

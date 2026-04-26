@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { uploadAudio } from "@/lib/api";
 import RecordButton from "@/components/RecordButton";
@@ -76,6 +77,19 @@ export default function Home() {
           {/* Upload */}
           <UploadZone onFile={handleFile} />
 
+          <div className="w-full rounded-2xl border border-fuchsia-200 bg-white/80 p-5 shadow-sm text-left space-y-2">
+            <p className="text-sm font-semibold text-gray-800">Text → singing AI</p>
+            <p className="text-xs text-gray-500">
+              Type a line, hear it from the voice API, then fix the melody in a piano roll and
+              export MIDI — separate from humming a tune.
+            </p>
+            <Link
+              href="/text-to-sing"
+              className="inline-flex items-center gap-2 text-sm font-semibold text-fuchsia-700 hover:text-fuchsia-900"
+            >
+              Open text-to-sing workspace →
+            </Link>
+          </div>
         </div>
       )}
 
